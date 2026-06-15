@@ -1,0 +1,436 @@
+package services
+
+import (
+	"fmt"
+	"os"
+	"testing"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"vendor-onboarding-api/internal/database"
+	"vendor-onboarding-api/internal/models"
+)
+
+func setupTestDB(t *testing.T) {
+	t.Helper()
+	dbPath := fmt.Sprintf("/tmp/voa_test_%d.db", os.Getpid())
+	os.Remove(dbPath)
+
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("Failed to open test database: %v", err)
+	}
+
+	err = db.AutoMigrate(
+		&models.Vendor{},
+		&models.Qualification{},
+		&models.ApprovalFlow{},
+		&models.ApprovalRecord{},
+		&models.ApprovalNodeConfig{},
+		&models.ApprovalNodeSigner{},
+	)
+	if err != nil {
+		t.Fatalf("Failed to migrate: %v", err)
+	}
+
+	stages := []struct {
+		Stage     models.ApprovalStage
+		StageName string
+		Order     int
+		SignType  models.SignType
+	}{
+		{Stage: models.StageDataCollection, StageName: "资料收集", Order: 0, SignType: models.SignTypeSingle},
+		{Stage: models.StageComplianceCheck, StageName: "合规性检查", Order: 1, SignType: models.SignTypeAny},
+		{Stage: models.StageLevel1Approval, StageName: "一级审批", Order: 2, SignType: models.SignTypeAll},
+		{Stage: models.StageLevel2Approval, StageName: "二级审批", Order: 3, SignType: models.SignTypeMajority},
+	}
+	for _, s := range stages {
+		db.Create(&models.ApprovalNodeConfig{
+			Stage:      s.Stage,
+			StageOrder: s.Order,
+			StageName:  s.StageName,
+			SignType:   s.SignType,
+			IsEnabled:  true,
+		})
+	}
+
+	database.DB = db
+	t.Cleanup(func() {
+		os.Remove(dbPath)
+	})
+}
+
+func createTestVendor(t *testing.T, name string) *models.Vendor {
+	t.Helper()
+	db := database.GetDB()
+	vendor := &models.Vendor{
+		VendorCode:            "T" + name,
+		CompanyName:           name,
+		UnifiedSocialCreditCode: "91110000MA01234567",
+		LegalPerson:           "张三",
+		ContactPerson:         "李四",
+		ContactPhone:          "13800000000",
+		Status:                models.VendorStatusDraft,
+	}
+	if err := db.Create(vendor).Error; err != nil {
+		t.Fatalf("Failed to create vendor: %v", err)
+	}
+
+	flow := &models.ApprovalFlow{
+		VendorID:     vendor.ID,
+		CurrentStage: models.StageDataCollection,
+		StageOrder:   0,
+		Status:       models.ApprovalStatusPending,
+	}
+	if err := db.Create(flow).Error; err != nil {
+		t.Fatalf("Failed to create flow: %v", err)
+	}
+	vendor.CurrentStageID = flow.ID
+	db.Save(vendor)
+	return vendor
+}
+
+func TestApprovalService_Approve_SingleSigner(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	vendor := createTestVendor(t, "SingleVendor")
+
+	err := service.Approve(&models.ApprovalRequest{
+		VendorID: vendor.ID,
+		Remark:   "资料提交",
+	}, 100, "提交人")
+	if err != nil {
+		t.Fatalf("Approve failed: %v", err)
+	}
+
+	flow, err := service.GetFlow(vendor.ID)
+	if err != nil {
+		t.Fatalf("GetFlow failed: %v", err)
+	}
+
+	if flow.Flow.CurrentStage != models.StageComplianceCheck {
+		t.Errorf("Expected stage COMPLIANCE_CHECK, got %s", flow.Flow.CurrentStage)
+	}
+}
+
+func TestApprovalService_SignTypeAny_OneApproverEnough(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	db := database.GetDB()
+	var compConfig models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageComplianceCheck).First(&compConfig)
+	signers := []*models.ApprovalNodeSigner{
+		{ApprovalNodeID: compConfig.ID, ApproverID: 201, ApproverName: "合规员A", ApproverRole: "合规", Stage: models.StageComplianceCheck},
+		{ApprovalNodeID: compConfig.ID, ApproverID: 202, ApproverName: "合规员B", ApproverRole: "合规", Stage: models.StageComplianceCheck},
+	}
+	for _, s := range signers {
+		db.Create(s)
+	}
+
+	vendor := createTestVendor(t, "AnyVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+
+	err := service.Approve(&models.ApprovalRequest{
+		VendorID: vendor.ID,
+		Remark:   "合规通过",
+	}, 201, "合规员A")
+	if err != nil {
+		t.Fatalf("Approve failed: %v", err)
+	}
+
+	flow, err := service.GetFlow(vendor.ID)
+	if err != nil {
+		t.Fatalf("GetFlow failed: %v", err)
+	}
+	if flow.Flow.CurrentStage != models.StageLevel1Approval {
+		t.Errorf("Expected LEVEL_1_APPROVAL after ANY approval, got %s", flow.Flow.CurrentStage)
+	}
+}
+
+func TestApprovalService_SignTypeAll_RequiresAll(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	db := database.GetDB()
+	var cfg models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&cfg)
+	signers := []*models.ApprovalNodeSigner{
+		{ApprovalNodeID: cfg.ID, ApproverID: 301, ApproverName: "主管1", ApproverRole: "L1", Stage: models.StageLevel1Approval},
+		{ApprovalNodeID: cfg.ID, ApproverID: 302, ApproverName: "主管2", ApproverRole: "L1", Stage: models.StageLevel1Approval},
+		{ApprovalNodeID: cfg.ID, ApproverID: 303, ApproverName: "主管3", ApproverRole: "L1", Stage: models.StageLevel1Approval},
+	}
+	for _, s := range signers {
+		db.Create(s)
+	}
+
+	var cfg2 models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageComplianceCheck).First(&cfg2)
+
+	vendor := createTestVendor(t, "AllVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "快速合规")
+
+	err := service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+	if err != nil {
+		t.Fatalf("First L1 approve failed: %v", err)
+	}
+
+	flow1, _ := service.GetFlow(vendor.ID)
+	if flow1.Flow.CurrentStage != models.StageLevel1Approval {
+		t.Errorf("Should still in L1 after partial ALL approval")
+	}
+	if flow1.Flow.Status != models.ApprovalStatusPartial {
+		t.Errorf("Expected PARTIAL status, got %s", flow1.Flow.Status)
+	}
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 302, "主管2")
+	flow2, _ := service.GetFlow(vendor.ID)
+	if flow2.Flow.CurrentStage != models.StageLevel1Approval {
+		t.Errorf("Should still in L1 after 2 approvals of 3")
+	}
+
+	err = service.Approve(&models.ApprovalRequest{VendorID: vendor.ID, Remark: "全部通过"}, 303, "主管3")
+	if err != nil {
+		t.Fatalf("Final L1 approve failed: %v", err)
+	}
+
+	flowFinal, _ := service.GetFlow(vendor.ID)
+	if flowFinal.Flow.CurrentStage != models.StageLevel2Approval {
+		t.Errorf("Expected LEVEL_2_APPROVAL after ALL 3 signed, got %s", flowFinal.Flow.CurrentStage)
+	}
+}
+
+func TestApprovalService_SignTypeMajority(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	db := database.GetDB()
+	var cfg models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel2Approval).First(&cfg)
+	signers := []*models.ApprovalNodeSigner{
+		{ApprovalNodeID: cfg.ID, ApproverID: 401, ApproverName: "副总A", ApproverRole: "L2", Stage: models.StageLevel2Approval},
+		{ApprovalNodeID: cfg.ID, ApproverID: 402, ApproverName: "副总B", ApproverRole: "L2", Stage: models.StageLevel2Approval},
+		{ApprovalNodeID: cfg.ID, ApproverID: 403, ApproverName: "副总C", ApproverRole: "L2", Stage: models.StageLevel2Approval},
+	}
+	for _, s := range signers {
+		db.Create(s)
+	}
+
+	vendor := createTestVendor(t, "MajorityVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规")
+
+	var l1 models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&l1)
+	db.Create(&models.ApprovalNodeSigner{ApprovalNodeID: l1.ID, ApproverID: 301, ApproverName: "主管1", Stage: models.StageLevel1Approval})
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 401, "副总A")
+	flow1, _ := service.GetFlow(vendor.ID)
+	if flow1.Flow.CurrentStage != models.StageLevel2Approval {
+		t.Errorf("Should still in L2 after 1 of 3")
+	}
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID, Remark: "多数通过"}, 402, "副总B")
+	flowFinal, _ := service.GetFlow(vendor.ID)
+
+	if flowFinal.Flow.CurrentStage != models.StageCompleted {
+		t.Errorf("Expected COMPLETED after majority (2/3) approval, got %s", flowFinal.Flow.CurrentStage)
+	}
+	if flowFinal.Vendor.Status != models.VendorStatusApproved {
+		t.Errorf("Expected vendor APPROVED, got %s", flowFinal.Vendor.Status)
+	}
+}
+
+func TestApprovalService_RejectFlow(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	vendor := createTestVendor(t, "RejectVendor")
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+
+	err := service.Reject(&models.ApprovalRejectRequest{
+		VendorID: vendor.ID,
+		Remark:   "资料不全，驳回",
+	}, 201, "合规员A")
+	if err != nil {
+		t.Fatalf("Reject failed: %v", err)
+	}
+
+	flow, err := service.GetFlow(vendor.ID)
+	if err != nil {
+		t.Fatalf("GetFlow failed: %v", err)
+	}
+
+	if flow.Flow.Status != models.ApprovalStatusRejected {
+		t.Errorf("Expected flow REJECTED, got %s", flow.Flow.Status)
+	}
+	if flow.Flow.CurrentStage != models.StageRejected {
+		t.Errorf("Expected stage REJECTED, got %s", flow.Flow.CurrentStage)
+	}
+	if flow.Vendor.Status != models.VendorStatusRejected {
+		t.Errorf("Expected vendor REJECTED status, got %s", flow.Vendor.Status)
+	}
+}
+
+func TestApprovalService_DuplicateSigner_Rejected(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	db := database.GetDB()
+	var cfg models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&cfg)
+	db.Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: cfg.ID, ApproverID: 301, ApproverName: "主管1", Stage: models.StageLevel1Approval,
+	})
+	db.Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: cfg.ID, ApproverID: 302, ApproverName: "主管2", Stage: models.StageLevel1Approval,
+	})
+	db.Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: cfg.ID, ApproverID: 303, ApproverName: "主管3", Stage: models.StageLevel1Approval,
+	})
+
+	vendor := createTestVendor(t, "DupVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规")
+
+	err := service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+	if err != nil {
+		t.Fatalf("First approve should succeed: %v", err)
+	}
+
+	flow, _ := service.GetFlow(vendor.ID)
+	if flow.Flow.CurrentStage != models.StageLevel1Approval {
+		t.Fatalf("Flow should still be at L1 approval with 3 signers (ALL), got %s", flow.Flow.CurrentStage)
+	}
+
+	err = service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+	if err == nil {
+		t.Errorf("Expected duplicate signer error, got nil")
+	}
+}
+
+func TestApprovalService_NonSigner_Rejected(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	db := database.GetDB()
+	var cfg models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&cfg)
+	db.Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: cfg.ID, ApproverID: 301, ApproverName: "主管1", Stage: models.StageLevel1Approval,
+	})
+
+	vendor := createTestVendor(t, "NonSignerVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规快速")
+
+	err := service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 9999, "非会签人员")
+	if err == nil {
+		t.Errorf("Expected permission error for non-signer, got nil")
+	}
+}
+
+func TestApprovalService_CreateNodeConfig_And_List(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	req := &models.NodeConfigCreateRequest{
+		Stage:     models.StageLevel1Approval,
+		StageName: "一级审批会签",
+		SignType:  models.SignTypeAll,
+		Signers: []models.NodeSignerItem{
+			{ApproverID: 501, ApproverName: "审批员A", ApproverRole: "L1"},
+			{ApproverID: 502, ApproverName: "审批员B", ApproverRole: "L1"},
+		},
+	}
+
+	node, err := service.CreateNodeConfig(req)
+	if err != nil {
+		t.Fatalf("CreateNodeConfig failed: %v", err)
+	}
+	if node.SignType != models.SignTypeAll {
+		t.Errorf("Expected sign type ALL, got %s", node.SignType)
+	}
+
+	list, err := service.ListNodeConfigs()
+	if err != nil {
+		t.Fatalf("ListNodeConfigs failed: %v", err)
+	}
+	if len(list) < 1 {
+		t.Error("Expected at least 1 node config")
+	}
+
+	signers, err := service.GetNodeSigners(models.StageLevel1Approval)
+	if err != nil {
+		t.Fatalf("GetNodeSigners failed: %v", err)
+	}
+	if len(signers) != 2 {
+		t.Errorf("Expected 2 signers for L1 stage, got %d", len(signers))
+	}
+}
+
+func TestApprovalService_EvaluateSignCondition(t *testing.T) {
+	service := NewApprovalService()
+
+	cases := []struct {
+		name       string
+		signType   models.SignType
+		total      int
+		approved   int
+		rejected   int
+		expectDone bool
+	}{
+		{"SINGLE 0 done", models.SignTypeSingle, 1, 0, 0, false},
+		{"SINGLE approved", models.SignTypeSingle, 1, 1, 0, true},
+		{"ANY one approved", models.SignTypeAny, 3, 1, 0, true},
+		{"ALL 1 of 3", models.SignTypeAll, 3, 1, 0, false},
+		{"ALL 3 of 3", models.SignTypeAll, 3, 3, 0, true},
+		{"ALL 2+1 rejected", models.SignTypeAll, 3, 2, 1, true},
+		{"MAJORITY 3 need 2", models.SignTypeMajority, 3, 1, 0, false},
+		{"MAJORITY 3 with 2", models.SignTypeMajority, 3, 2, 0, true},
+		{"MAJORITY 5 need 3", models.SignTypeMajority, 5, 2, 0, false},
+		{"MAJORITY 5 with 3", models.SignTypeMajority, 5, 3, 0, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := service.evaluateSignCondition(tc.signType, tc.total, tc.approved, tc.rejected)
+			if result != tc.expectDone {
+				t.Errorf("%s: expected %v got %v (type=%s total=%d a=%d r=%d)",
+					tc.name, tc.expectDone, result, tc.signType, tc.total, tc.approved, tc.rejected)
+			}
+		})
+	}
+}
+
+func TestApprovalService_Transition_Manual(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+
+	vendor := createTestVendor(t, "TransVendor")
+
+	err := service.Transition(&models.StageTransitionRequest{
+		VendorID: vendor.ID,
+		ToStage:  models.StageCompleted,
+		Remark:   "特批跳过所有阶段",
+	}, 9999, "超级管理员")
+	if err != nil {
+		t.Fatalf("Transition failed: %v", err)
+	}
+
+	flow, _ := service.GetFlow(vendor.ID)
+	if flow.Flow.CurrentStage != models.StageCompleted {
+		t.Errorf("Expected COMPLETED after transition, got %s", flow.Flow.CurrentStage)
+	}
+	if flow.Vendor.Status != models.VendorStatusApproved {
+		t.Errorf("Expected vendor APPROVED after transition")
+	}
+}

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -12,11 +13,13 @@ import (
 
 type QualificationHandler struct {
 	qualificationService *services.QualificationService
+	fileService          *services.FileService
 }
 
 func NewQualificationHandler() *QualificationHandler {
 	return &QualificationHandler{
 		qualificationService: services.NewQualificationService(),
+		fileService:          services.NewFileService(),
 	}
 }
 
@@ -40,6 +43,57 @@ func (h *QualificationHandler) Upload(c *gin.Context) {
 	}
 
 	utils.Success(c, q)
+}
+
+func (h *QualificationHandler) UploadFile(c *gin.Context) {
+	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	if err != nil {
+		utils.BadRequest(c, "无效的供应商ID")
+		return
+	}
+
+	file, err := c.FormFile("file")
+	if err != nil {
+		utils.BadRequest(c, "缺少文件字段 file: "+err.Error())
+		return
+	}
+
+	qTypeStr := c.PostForm("type")
+	if qTypeStr == "" {
+		utils.BadRequest(c, "缺少 type 字段")
+		return
+	}
+	qType := models.QualificationType(qTypeStr)
+
+	name := c.PostForm("name")
+	if name == "" {
+		name = file.Filename
+	}
+	number := c.PostForm("number")
+	issuedBy := c.PostForm("issued_by")
+
+	var issuedDate *time.Time
+	if v := c.PostForm("issued_date"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			issuedDate = &t
+		}
+	}
+	var expiryDate *time.Time
+	if v := c.PostForm("expiry_date"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			expiryDate = &t
+		}
+	}
+
+	result, err := h.fileService.UploadQualificationFile(
+		vendorID, file, qType, name, number, issuedBy, issuedDate, expiryDate,
+	)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+
+	utils.Success(c, result)
 }
 
 func (h *QualificationHandler) ListByVendor(c *gin.Context) {

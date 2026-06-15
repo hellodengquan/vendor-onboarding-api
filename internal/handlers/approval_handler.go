@@ -113,3 +113,47 @@ func (h *ApprovalHandler) Transition(c *gin.Context) {
 
 	utils.Success(c, gin.H{"message": "阶段流转成功"})
 }
+
+func (h *ApprovalHandler) CreateNodeConfig(c *gin.Context) {
+	var req models.NodeConfigCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+
+	node, err := h.approvalService.CreateNodeConfig(&req)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, node)
+}
+
+func (h *ApprovalHandler) ListNodeConfigs(c *gin.Context) {
+	list, err := h.approvalService.ListNodeConfigs()
+	if err != nil {
+		utils.InternalError(c, "查询失败")
+		return
+	}
+	utils.Success(c, list)
+}
+
+func (h *ApprovalHandler) GetStageSignStatus(c *gin.Context) {
+	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	if err != nil {
+		utils.BadRequest(c, "无效的供应商ID")
+		return
+	}
+	stage := models.ApprovalStage(c.Param("stage"))
+	if stage == "" {
+		utils.BadRequest(c, "缺少阶段参数")
+		return
+	}
+
+	status, err := h.approvalService.GetStageSignStatus(vendorID, stage)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, status)
+}
