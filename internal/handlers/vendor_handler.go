@@ -1,11 +1,8 @@
 package handlers
 
 import (
-	"strconv"
-
 	"github.com/gin-gonic/gin"
 
-	"vendor-onboarding-api/internal/models"
 	"vendor-onboarding-api/internal/services"
 	"vendor-onboarding-api/pkg/utils"
 )
@@ -21,99 +18,75 @@ func NewVendorHandler() *VendorHandler {
 }
 
 func (h *VendorHandler) Create(c *gin.Context) {
-	var req models.VendorCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
-		return
-	}
-
-	vendor, err := h.vendorService.Create(&req)
+	req, err := h.vendorService.BindCreate(c)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
+	vendor, err := h.vendorService.Create(req)
+	if err != nil {
+		utils.WriteError(c, err)
+		return
+	}
 	utils.Success(c, vendor)
 }
 
 func (h *VendorHandler) Get(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	id, err := h.vendorService.BindGetOrSubmit(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.WriteError(c, err)
 		return
 	}
-
 	vendor, err := h.vendorService.GetByID(id)
 	if err != nil {
 		utils.NotFound(c, "供应商不存在")
 		return
 	}
-
 	utils.Success(c, vendor)
 }
 
 func (h *VendorHandler) List(c *gin.Context) {
-	var req models.VendorListRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	req, err := h.vendorService.BindList(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
-	if req.Page < 1 {
-		req.Page = 1
-	}
-	if req.PageSize < 1 || req.PageSize > 100 {
-		req.PageSize = 20
-	}
-
-	result, err := h.vendorService.List(&req)
+	result, err := h.vendorService.List(req)
 	if err != nil {
 		utils.InternalError(c, "查询失败")
 		return
 	}
-
 	utils.Success(c, result)
 }
 
 func (h *VendorHandler) Update(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	id, req, err := h.vendorService.BindUpdate(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.WriteError(c, err)
 		return
 	}
-
-	var req models.VendorUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
-		return
-	}
-
-	vendor, err := h.vendorService.Update(id, &req)
+	vendor, err := h.vendorService.Update(id, req)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, vendor)
 }
 
 func (h *VendorHandler) Submit(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	id, err := h.vendorService.BindGetOrSubmit(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.WriteError(c, err)
 		return
 	}
-
 	submitterID, _ := c.Get("user_id")
 	var uid uint64 = 0
 	if submitterID != nil {
 		uid = submitterID.(uint64)
 	}
-
 	if err := h.vendorService.Submit(id, uid); err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, gin.H{"message": "提交成功"})
 }

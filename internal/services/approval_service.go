@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -11,6 +12,18 @@ import (
 	"vendor-onboarding-api/internal/database"
 	"vendor-onboarding-api/internal/models"
 )
+
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "UNIQUE constraint failed") ||
+		strings.Contains(s, "Duplicate entry") ||
+		strings.Contains(s, "violates unique constraint")
+}
+
+var ErrVersionConflict = errors.New("审批版本冲突，请刷新后重试")
 
 var StageOrderMap = map[models.ApprovalStage]int{
 	models.StageDataCollection:  0,
@@ -233,6 +246,7 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 		tx.Rollback()
 		return errors.New("审批流程不存在")
 	}
+	expectedVersion := flow.Version
 
 	if flow.Status == models.ApprovalStatusApproved {
 		tx.Rollback()
@@ -268,6 +282,9 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 	}
 	if err := tx.Create(record).Error; err != nil {
 		tx.Rollback()
+		if isUniqueViolation(err) {
+			return errors.New("该审批人已在本阶段签署过（并发冲突）")
+		}
 		return err
 	}
 
@@ -285,11 +302,27 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 	flow.RejectedCount = int(rejectedCount)
 	signerCount, _ := s.countSigners(flow.CurrentStage)
 	flow.SignerCount = signerCount
+	flow.Version++
 
 	if rejectedCount > 0 {
 		if err := s.rejectFlow(tx, &flow, req.VendorID, approverID, approverName, "会签中有人驳回，流程终止"); err != nil {
 			tx.Rollback()
 			return err
+		}
+		result := tx.Model(&flow).Where("id = ? AND version = ?", flow.ID, expectedVersion).Updates(map[string]interface{}{
+			"status":         flow.Status,
+			"approved_count": flow.ApprovedCount,
+			"rejected_count": flow.RejectedCount,
+			"signer_count":   flow.SignerCount,
+			"version":        flow.Version,
+		})
+		if result.Error != nil {
+			tx.Rollback()
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			tx.Rollback()
+			return errors.New("审批版本冲突，请刷新后重试")
 		}
 		return tx.Commit().Error
 	}
@@ -300,15 +333,26 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 			tx.Rollback()
 			return err
 		}
-		return tx.Commit().Error
-	}
-
-	if approvedCount > 0 && approvedCount < int64(signerCount) {
+	} else if approvedCount > 0 && approvedCount < int64(signerCount) {
 		flow.Status = models.ApprovalStatusPartial
 	}
-	if err := tx.Save(&flow).Error; err != nil {
+
+	result := tx.Model(&flow).Where("id = ? AND version = ?", flow.ID, expectedVersion).Updates(map[string]interface{}{
+		"current_stage":  flow.CurrentStage,
+		"stage_order":    flow.StageOrder,
+		"status":         flow.Status,
+		"approved_count": flow.ApprovedCount,
+		"rejected_count": flow.RejectedCount,
+		"signer_count":   flow.SignerCount,
+		"version":        flow.Version,
+	})
+	if result.Error != nil {
 		tx.Rollback()
-		return err
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		tx.Rollback()
+		return errors.New("审批版本冲突，请刷新后重试")
 	}
 	return tx.Commit().Error
 }
@@ -316,19 +360,35 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 func (s *ApprovalService) Reject(req *models.ApprovalRejectRequest, approverID uint64, approverName string) error {
 	db := database.GetDB()
 
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
 	var flow models.ApprovalFlow
-	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		tx.Rollback()
 		return errors.New("审批流程不存在")
 	}
+	expectedVersion := flow.Version
 
 	if flow.Status == models.ApprovalStatusApproved {
+		tx.Rollback()
 		return errors.New("流程已完成审批，不可驳回")
 	}
 	if flow.Status == models.ApprovalStatusRejected {
+		tx.Rollback()
 		return errors.New("流程已被驳回")
 	}
 
 	if err := s.validateSignerPermission(flow.CurrentStage, approverID); err != nil {
+		tx.Rollback()
 		return err
 	}
 
@@ -343,11 +403,35 @@ func (s *ApprovalService) Reject(req *models.ApprovalRejectRequest, approverID u
 		Remark:       req.Remark,
 		ApprovedAt:   &now,
 	}
-	if err := db.Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return err
 	}
 
-	return s.rejectFlow(db, &flow, req.VendorID, approverID, approverName, req.Remark)
+	if err := s.rejectFlow(tx, &flow, req.VendorID, approverID, approverName, req.Remark); err != nil {
+		tx.Rollback()
+		return err
+	}
+	flow.Version++
+
+	result := tx.Model(&flow).Where("id = ? AND version = ?", flow.ID, expectedVersion).Updates(map[string]interface{}{
+		"current_stage":  flow.CurrentStage,
+		"stage_order":    flow.StageOrder,
+		"status":         flow.Status,
+		"approved_count": flow.ApprovedCount,
+		"rejected_count": flow.RejectedCount,
+		"signer_count":   flow.SignerCount,
+		"version":        flow.Version,
+	})
+	if result.Error != nil {
+		tx.Rollback()
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		tx.Rollback()
+		return errors.New("审批版本冲突，请刷新后重试")
+	}
+	return tx.Commit().Error
 }
 
 func (s *ApprovalService) rejectFlow(db *gorm.DB, flow *models.ApprovalFlow, vendorID uint64, approverID uint64, approverName string, remark string) error {
@@ -355,9 +439,6 @@ func (s *ApprovalService) rejectFlow(db *gorm.DB, flow *models.ApprovalFlow, ven
 	flow.StageOrder = StageOrderMap[models.StageRejected]
 	flow.Status = models.ApprovalStatusRejected
 	flow.RejectedCount++
-	if err := db.Save(flow).Error; err != nil {
-		return err
-	}
 
 	var vendor models.Vendor
 	db.First(&vendor, vendorID)
@@ -374,9 +455,6 @@ func (s *ApprovalService) advanceToNextStage(db *gorm.DB, flow *models.ApprovalF
 		flow.ApprovedCount = 0
 		flow.RejectedCount = 0
 		flow.SignerCount = 0
-		if err := db.Save(flow).Error; err != nil {
-			return err
-		}
 		var vendor models.Vendor
 		db.First(&vendor, vendorID)
 		vendor.Status = models.VendorStatusApproved
@@ -390,9 +468,6 @@ func (s *ApprovalService) advanceToNextStage(db *gorm.DB, flow *models.ApprovalF
 	flow.RejectedCount = 0
 	signerCount, _ := s.countSigners(nextStage)
 	flow.SignerCount = signerCount
-	if err := db.Save(flow).Error; err != nil {
-		return err
-	}
 
 	var vendor models.Vendor
 	db.First(&vendor, vendorID)
@@ -408,17 +483,32 @@ func (s *ApprovalService) advanceToNextStage(db *gorm.DB, flow *models.ApprovalF
 func (s *ApprovalService) Transition(req *models.StageTransitionRequest, operatorID uint64, operatorName string) error {
 	db := database.GetDB()
 
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
 	var flow models.ApprovalFlow
-	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		tx.Rollback()
 		return errors.New("审批流程不存在")
 	}
+	expectedVersion := flow.Version
 
 	toOrder, exists := StageOrderMap[req.ToStage]
 	if !exists {
+		tx.Rollback()
 		return errors.New("目标阶段无效")
 	}
 
 	if toOrder <= flow.StageOrder && req.ToStage != models.StageRejected {
+		tx.Rollback()
 		return errors.New("不能回退到之前的阶段")
 	}
 
@@ -433,7 +523,8 @@ func (s *ApprovalService) Transition(req *models.StageTransitionRequest, operato
 		Remark:       fmt.Sprintf("手动流转: %s", req.Remark),
 		ApprovedAt:   &now,
 	}
-	if err := db.Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return err
 	}
 
@@ -444,19 +535,38 @@ func (s *ApprovalService) Transition(req *models.StageTransitionRequest, operato
 	if req.ToStage == models.StageCompleted {
 		flow.Status = models.ApprovalStatusApproved
 		var vendor models.Vendor
-		db.First(&vendor, req.VendorID)
+		tx.First(&vendor, req.VendorID)
 		vendor.Status = models.VendorStatusApproved
-		db.Save(&vendor)
+		tx.Save(&vendor)
 	} else if req.ToStage == models.StageRejected {
 		flow.Status = models.ApprovalStatusRejected
 		var vendor models.Vendor
-		db.First(&vendor, req.VendorID)
+		tx.First(&vendor, req.VendorID)
 		vendor.Status = models.VendorStatusRejected
-		db.Save(&vendor)
+		tx.Save(&vendor)
 	}
 	signerCount, _ := s.countSigners(req.ToStage)
 	flow.SignerCount = signerCount
-	return db.Save(&flow).Error
+	flow.Version++
+
+	result := tx.Model(&flow).Where("id = ? AND version = ?", flow.ID, expectedVersion).Updates(map[string]interface{}{
+		"current_stage":  flow.CurrentStage,
+		"stage_order":    flow.StageOrder,
+		"status":         flow.Status,
+		"approved_count": flow.ApprovedCount,
+		"rejected_count": flow.RejectedCount,
+		"signer_count":   flow.SignerCount,
+		"version":        flow.Version,
+	})
+	if result.Error != nil {
+		tx.Rollback()
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		tx.Rollback()
+		return errors.New("审批版本冲突，请刷新后重试")
+	}
+	return tx.Commit().Error
 }
 
 func (s *ApprovalService) validateSignerPermission(stage models.ApprovalStage, approverID uint64) error {
@@ -570,11 +680,26 @@ func (s *ApprovalService) AddSigner(req *models.AddSignerRequest, addedBy uint64
 func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint64, withdrawnByName string) error {
 	db := database.GetDB()
 
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
 	var flow models.ApprovalFlow
-	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		tx.Rollback()
 		return errors.New("流程不存在")
 	}
+	expectedVersion := flow.Version
+
 	if flow.Status == models.ApprovalStatusApproved {
+		tx.Rollback()
 		return errors.New("已完成的审批不可撤回")
 	}
 
@@ -584,14 +709,17 @@ func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint
 		var ok bool
 		toOrder, ok = StageOrderMap[toStage]
 		if !ok {
+			tx.Rollback()
 			return errors.New("目标阶段无效")
 		}
 		if toOrder >= flow.StageOrder {
+			tx.Rollback()
 			return errors.New("只能回退到更早的阶段")
 		}
 	} else {
 		switch flow.CurrentStage {
 		case models.StageDataCollection:
+			tx.Rollback()
 			return errors.New("当前为初始阶段，无需撤回")
 		case models.StageComplianceCheck:
 			toStage = models.StageDataCollection
@@ -622,7 +750,8 @@ func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint
 		IsRollback:      req.IsRollback,
 		CreatedAt:       now,
 	}
-	if err := db.Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return err
 	}
 
@@ -631,15 +760,34 @@ func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint
 	flow.Status = models.ApprovalStatusWithdrawn
 	flow.ApprovedCount = 0
 	flow.RejectedCount = 0
+	flow.SignerCount = 0
+	flow.Version++
 	flow.WithdrawnBy = &withdrawnBy
 	flow.WithdrawnAt = &now
-	if err := db.Save(&flow).Error; err != nil {
-		return err
+
+	result := tx.Model(&flow).Where("id = ? AND version = ?", flow.ID, expectedVersion).Updates(map[string]interface{}{
+		"current_stage":  flow.CurrentStage,
+		"stage_order":    flow.StageOrder,
+		"status":         flow.Status,
+		"approved_count": flow.ApprovedCount,
+		"rejected_count": flow.RejectedCount,
+		"signer_count":   flow.SignerCount,
+		"version":        flow.Version,
+		"withdrawn_by":   flow.WithdrawnBy,
+		"withdrawn_at":   flow.WithdrawnAt,
+	})
+	if result.Error != nil {
+		tx.Rollback()
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		tx.Rollback()
+		return errors.New("审批版本冲突，请刷新后重试")
 	}
 
 	if req.IsRollback {
 		var vendor models.Vendor
-		db.First(&vendor, req.VendorID)
+		tx.First(&vendor, req.VendorID)
 		switch toStage {
 		case models.StageDataCollection:
 			vendor.Status = models.VendorStatusDraft
@@ -648,20 +796,26 @@ func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint
 		default:
 			vendor.Status = models.VendorStatusPendingApproval
 		}
-		db.Save(&vendor)
+		if err := tx.Save(&vendor).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
 
-		go func() {
+		go func(vid uint64) {
 			time.Sleep(100 * time.Millisecond)
-			db.Model(&models.ApprovalFlow{}).Where("vendor_id = ?", req.VendorID).Update("status", models.ApprovalStatusPending)
-		}()
+			db.Model(&models.ApprovalFlow{}).Where("vendor_id = ?", vid).Update("status", models.ApprovalStatusPending)
+		}(req.VendorID)
 	} else {
 		var vendor models.Vendor
-		db.First(&vendor, req.VendorID)
+		tx.First(&vendor, req.VendorID)
 		vendor.Status = models.VendorStatusDraft
-		db.Save(&vendor)
+		if err := tx.Save(&vendor).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
 	}
 
-	return nil
+	return tx.Commit().Error
 }
 
 func (s *ApprovalService) CreateParallelGroup(req *models.ParallelGroupCreateRequest) (*models.ParallelGroup, error) {

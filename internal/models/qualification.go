@@ -44,6 +44,7 @@ type Qualification struct {
 }
 
 type QualificationUploadRequest struct {
+	VendorID   uint64            `json:"vendor_id"`
 	Type       QualificationType `json:"type" binding:"required"`
 	Name       string            `json:"name" binding:"required"`
 	FileURL    string            `json:"file_url" binding:"required"`

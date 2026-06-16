@@ -118,6 +118,13 @@ func (s *S3Storage) KeyFromURL(publicURL string) (string, error) {
 	return path, nil
 }
 
+func (s *S3Storage) List(ctx context.Context, prefix string) ([]FileInfo, error) {
+	if s.emulate {
+		return s.local.List(ctx, prefix)
+	}
+	return nil, fmt.Errorf("real S3 List requires aws-sdk-go-v2/service/s3 (paginated ListObjectsV2)")
+}
+
 func EnvS3Config() S3Config {
 	useSSL := true
 	if v := os.Getenv("S3_USE_SSL"); v == "0" || v == "false" {

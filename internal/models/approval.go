@@ -63,6 +63,7 @@ type ApprovalFlow struct {
 	ApprovedCount int            `gorm:"not null;default:0" json:"approved_count"`
 	RejectedCount int            `gorm:"not null;default:0" json:"rejected_count"`
 	SignerCount   int            `gorm:"not null;default:0" json:"signer_count"`
+	Version       int            `gorm:"not null;default:1;index" json:"version"`
 	ParallelGroupID *uint64      `gorm:"index" json:"parallel_group_id,omitempty"`
 	WithdrawnBy     *uint64      `json:"withdrawn_by,omitempty"`
 	WithdrawnAt     *time.Time   `json:"withdrawn_at,omitempty"`
@@ -152,11 +153,11 @@ type WithdrawalRecord struct {
 
 type ApprovalRecord struct {
 	ID           uint64         `gorm:"primaryKey;autoIncrement" json:"id"`
-	VendorID     uint64         `gorm:"not null;index" json:"vendor_id"`
-	Stage        ApprovalStage  `gorm:"size:32;not null;index" json:"stage"`
+	VendorID     uint64         `gorm:"not null;uniqueIndex:idx_vendor_stage_approver,priority:1;index" json:"vendor_id"`
+	Stage        ApprovalStage  `gorm:"size:32;not null;uniqueIndex:idx_vendor_stage_approver,priority:2;index" json:"stage"`
 	StageOrder   int            `gorm:"not null" json:"stage_order"`
 	Status       ApprovalStatus `gorm:"size:32;not null" json:"status"`
-	ApproverID   uint64         `gorm:"not null;index" json:"approver_id"`
+	ApproverID   uint64         `gorm:"not null;uniqueIndex:idx_vendor_stage_approver,priority:3;index" json:"approver_id"`
 	ApproverName string         `gorm:"size:64" json:"approver_name"`
 	Remark       string         `gorm:"type:text" json:"remark"`
 	ApprovedAt   *time.Time     `json:"approved_at"`
@@ -259,10 +260,15 @@ type APIKey struct {
 	UpdatedAt time.Time  `json:"updated_at"`
 }
 
+type APIKeyCreateRequest struct {
+	AppKey      string `json:"app_key" binding:"required"`
+	AppName     string `json:"app_name" binding:"required,max=200"`
+	Description string `json:"description"`
+}
+
 type APIKeyRotateRequest struct {
-	AppKey       string     `json:"app_key" binding:"required"`
-	NewAppSecret string     `json:"new_app_secret"`
-	OldVersion   int        `json:"old_expire_hours"`
-	Remark       string     `json:"remark"`
+	AppKey        string `json:"app_key" binding:"required"`
+	ExpireOldHours int    `json:"expire_old_hours"`
+	Remark        string `json:"remark"`
 }
 

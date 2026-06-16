@@ -4,7 +4,7 @@ info:
   description: |
     供应商入驻审批系统的所有公开接口契约。
     基于 HMAC-SHA256 签名鉴权（参见 Authentication 节）。
-    审批阶段顺序：DATA_COLLECTION → COMPLIANCE_CHECK → L1_APPROVAL（会签All）→ L2_APPROVAL（多数通过）→ FINANCE_APPROVAL → LEGAL_APPROVAL → COMPLETED。
+    审批阶段顺序：DATA_COLLECTION → COMPLIANCE_CHECK → LEVEL_1_APPROVAL（会签ALL）→ LEVEL_2_APPROVAL（多数通过MAJORITY）→ FINANCE_APPROVAL → LEGAL_APPROVAL → COMPLETED。
   version: 1.2.0
   contact:
     name: Vendor Onboarding Team
@@ -41,13 +41,120 @@ components:
         data: { type: object, nullable: true }
     ApprovalStage:
       type: string
-      enum: [DATA_COLLECTION, COMPLIANCE_CHECK, L1_APPROVAL, L2_APPROVAL, FINANCE_APPROVAL, LEGAL_APPROVAL, COMPLETED, REJECTED]
+      enum: [DATA_COLLECTION, COMPLIANCE_CHECK, LEVEL_1_APPROVAL, LEVEL_2_APPROVAL, FINANCE_APPROVAL, LEGAL_APPROVAL, PARALLEL_GROUP, COMPLETED, REJECTED, WITHDRAWN]
+      description: |
+        审批阶段枚举：
+        - DATA_COLLECTION: 资料收集
+        - COMPLIANCE_CHECK: 合规检查
+        - LEVEL_1_APPROVAL: 一级审批（会签ALL）
+        - LEVEL_2_APPROVAL: 二级审批（多数通过MAJORITY）
+        - FINANCE_APPROVAL: 财务审批
+        - LEGAL_APPROVAL: 法务审批
+        - PARALLEL_GROUP: 并行组
+        - COMPLETED: 已完成
+        - REJECTED: 已驳回
+        - WITHDRAWN: 已撤回
     ApprovalStatus:
       type: string
-      enum: [PENDING, PROCESSING, PARTIAL, APPROVED, REJECTED, WITHDRAWN]
+      enum: [PENDING, APPROVED, REJECTED, PARTIAL, WITHDRAWN]
+      description: |
+        审批状态枚举：
+        - PENDING: 待审批
+        - APPROVED: 已通过
+        - REJECTED: 已驳回
+        - PARTIAL: 部分通过（会签中）
+        - WITHDRAWN: 已撤回
     SignType:
       type: string
       enum: [SINGLE, ANY, ALL, MAJORITY]
+      description: |
+        签署方式枚举：
+        - SINGLE: 单人审批
+        - ANY: 或签（任一人通过即可）
+        - ALL: 并签（所有人通过）
+        - MAJORITY: 多数通过
+    ApprovalNodeSigner:
+      type: object
+      description: 审批节点签署人
+      properties:
+        id: { type: integer, format: uint64 }
+        approver_id: { type: integer, format: uint64, description: 审批人ID }
+        approver_name: { type: string, description: 审批人姓名 }
+        approver_role: { type: string, description: 审批人角色 }
+        stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        sign_status: { type: string, enum: [PENDING, APPROVED, REJECTED], description: 签署状态 }
+        approved_at: { type: string, format: date-time, description: 签署时间 }
+        remark: { type: string, description: 签署意见 }
+    ApprovalNodeStatus:
+      type: object
+      description: 单个审批节点的状态详情
+      required: [stage, stage_name, sign_type, total_signers, approved_count, rejected_count, is_complete]
+      properties:
+        stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        stage_name: { type: string, description: 节点显示名称 }
+        stage_order: { type: integer, description: 节点顺序号 }
+        sign_type: { "$ref": "#/components/schemas/SignType" }
+        total_signers: { type: integer, description: 该节点总签署人数 }
+        approved_count: { type: integer, description: 已通过人数 }
+        rejected_count: { type: integer, description: 已驳回人数 }
+        is_complete: { type: boolean, description: 该节点是否已完成 }
+        is_current: { type: boolean, description: 是否为当前正在处理的节点 }
+        signers:
+          type: array
+          description: 签署人列表及状态
+          items: { "$ref": "#/components/schemas/ApprovalNodeSigner" }
+        records:
+          type: array
+          description: 该节点的所有审批记录
+          items: { "$ref": "#/components/schemas/ApprovalRecord" }
+        completed_at: { type: string, format: date-time, description: 节点完成时间 }
+    ApprovalRecord:
+      type: object
+      description: 审批记录
+      properties:
+        id: { type: integer, format: uint64 }
+        vendor_id: { type: integer, format: uint64 }
+        stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        stage_order: { type: integer }
+        status: { "$ref": "#/components/schemas/ApprovalStatus" }
+        approver_id: { type: integer, format: uint64 }
+        approver_name: { type: string }
+        remark: { type: string }
+        approved_at: { type: string, format: date-time }
+    FlowDetailResponse:
+      type: object
+      description: 审批流程详情（包含所有节点状态）
+      properties:
+        flow: { "$ref": "#/components/schemas/ApprovalFlow" }
+        vendor: { "$ref": "#/components/schemas/VendorResponse" }
+        records:
+          type: array
+          items: { "$ref": "#/components/schemas/ApprovalRecord" }
+        node_statuses:
+          type: array
+          description: 所有审批节点的状态列表（按顺序排列）
+          items: { "$ref": "#/components/schemas/ApprovalNodeStatus" }
+        current_signers:
+          type: array
+          description: 当前节点的签署人
+          items: { "$ref": "#/components/schemas/ApprovalNodeSigner" }
+    ApprovalFlow:
+      type: object
+      description: 审批流程
+      properties:
+        id: { type: integer, format: uint64 }
+        vendor_id: { type: integer, format: uint64 }
+        current_stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        stage_order: { type: integer }
+        status: { "$ref": "#/components/schemas/ApprovalStatus" }
+        approved_count: { type: integer, description: 当前节点已通过人数 }
+        rejected_count: { type: integer, description: 当前节点已驳回人数 }
+        signer_count: { type: integer, description: 当前节点签署人总数 }
+        version: { type: integer, description: 乐观锁版本号 }
+        withdrawn_by: { type: integer, format: uint64, description: 撤回人ID }
+        withdrawn_at: { type: string, format: date-time, description: 撤回时间 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     VendorCreateRequest:
       type: object
       required: [company_name, unified_social_credit_code, legal_person, contact_person, contact_phone]
@@ -263,14 +370,27 @@ paths:
   /vendors/{id}/approval/flow:
     get:
       tags: [审批流转]
-      summary: 查询审批流详情（包含所有记录）
+      summary: 查询审批流详情（包含所有节点状态、记录、签署人）
+      description: |
+        返回完整的审批流程详情，包括：
+        - flow: 流程基本信息（当前阶段、状态、乐观锁版本号）
+        - node_statuses: 所有审批节点的状态列表（按顺序排列），每个节点包含签署人状态、通过/驳回人数、是否完成
+        - records: 所有审批记录
+        - current_signers: 当前节点的签署人列表
       parameters:
         - in: path
           name: id
           required: true
           schema: { type: integer, format: uint64 }
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ "$ref": "#/components/schemas/Response" }]
+                properties:
+                  data: { "$ref": "#/components/schemas/FlowDetailResponse" }
 
   /vendors/{id}/approval/records:
     get:

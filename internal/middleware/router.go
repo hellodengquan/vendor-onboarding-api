@@ -93,9 +93,9 @@ func SetupRouter() *gin.Engine {
 
 		qualifications := api.Group("/qualifications")
 		{
-			qualifications.GET("/:id", qualificationHandler.Get)
-			qualifications.POST("/:id/verify", qualificationHandler.Verify)
-			qualifications.DELETE("/:id", qualificationHandler.Delete)
+			qualifications.GET("/:qid", qualificationHandler.Get)
+			qualifications.POST("/:qid/verify", qualificationHandler.Verify)
+			qualifications.DELETE("/:qid", qualificationHandler.Delete)
 		}
 	}
 

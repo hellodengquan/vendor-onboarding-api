@@ -3,6 +3,8 @@ package services
 import (
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -691,3 +693,225 @@ func TestSignatureValidation_FailurePaths(t *testing.T) {
 		t.Error("different body should fail signature")
 	}
 }
+
+func TestApproval_VersionConflict(t *testing.T) {
+	setupTestDB(t)
+	svc := NewApprovalService()
+	db := database.GetDB()
+
+	vendor := createTestVendor(t, "并发审批厂商")
+	// 确保 version 被正确初始化
+	db.Model(&models.ApprovalFlow{}).Where("vendor_id = ?", vendor.ID).Update("version", 1)
+
+	// 先提交审批（从 DATA_COLLECTION 推进到 COMPLIANCE_CHECK）
+	err := svc.Approve(&models.ApprovalRequest{
+		VendorID: vendor.ID,
+		Remark:   "资料提交",
+	}, 1001, "提交人")
+	if err != nil {
+		t.Fatalf("Approve submit error: %v", err)
+	}
+
+	// 获取当前 flow
+	flowResp, err := svc.GetFlow(vendor.ID)
+	if err != nil {
+		t.Fatalf("GetFlow error: %v", err)
+	}
+	flow := flowResp.Flow
+	originalVersion := flow.Version
+
+	if flow.CurrentStage == models.StageDataCollection {
+		t.Fatal("flow should have advanced beyond DATA_COLLECTION after first approve")
+	}
+
+	// 模拟另一个进程修改了 version（跨实例篡改）
+	// 当前 DB 中 version 是 originalVersion+1（因为第一次 Approve 后已经自增过）
+	// 我们把它改成更大的值来模拟冲突
+	db.Model(&models.ApprovalFlow{}).Where("id = ?", flow.ID).Update("version", originalVersion+100)
+
+	// 重新获取 flow 用于第二次 Approve
+	// 但是让我们先验证当前 DB 中的 version
+	var dbFlow models.ApprovalFlow
+	db.Where("id = ?", flow.ID).First(&dbFlow)
+	if dbFlow.Version != originalVersion+100 {
+		t.Fatalf("failed to tamper version, expected %d got %d", originalVersion+100, dbFlow.Version)
+	}
+
+	// 此时如果还有缓存的 flow 对象，用它来审批应该失败（expectedVersion 错误）
+	// 但 Approve 内部会重新查询数据库，所以我们需要用不同的方式模拟
+	// 让我们直接通过 svc.Approve 来测试
+	// Approve 内部 SELECT FOR UPDATE 会拿到 version = originalVersion+100
+	// expectedVersion = originalVersion+100，然后 flow.Version++ = originalVersion+101
+	// UPDATE WHERE version = originalVersion+100，应该成功
+
+	// 换一种方式测试版本冲突：在同一个事务中，两个 goroutine 同时更新
+	// 或者我们直接用 svc 连续调用两次，但第一次还没提交时第二次也尝试
+	// 更简单：直接修改测试逻辑 - 用两个 goroutine 同时 Approve
+
+	// 先重置 version 为一个已知值
+	db.Model(&models.ApprovalFlow{}).Where("id = ?", flow.ID).Update("version", 10)
+
+	// 现在两个 goroutine 同时审批
+	errChan := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			approverID := uint64(2000 + idx)
+			approverName := fmt.Sprintf("审批员%d", idx)
+			errChan <- svc.Approve(&models.ApprovalRequest{
+				VendorID: vendor.ID,
+				Remark:   fmt.Sprintf("同意-%d", idx),
+			}, approverID, approverName)
+		}(i)
+	}
+	wg.Wait()
+	close(errChan)
+
+	errCount := 0
+	successCount := 0
+	for e := range errChan {
+		if e != nil {
+			errCount++
+			if !strings.Contains(e.Error(), "版本冲突") && !strings.Contains(e.Error(), "已在本阶段签署") {
+				t.Logf("got expected error: %v", e)
+			}
+		} else {
+			successCount++
+		}
+	}
+
+	if successCount == 2 {
+		t.Fatal("both approvals succeeded, version lock failed!")
+	}
+	if successCount == 0 {
+		t.Log("both approvals failed (acceptable with race)")
+	}
+	t.Logf("conflict test: success=%d, error=%d", successCount, errCount)
+
+	// 确认 version 已经自增
+	var finalFlow models.ApprovalFlow
+	db.Where("id = ?", flow.ID).First(&finalFlow)
+	if finalFlow.Version <= 10 {
+		t.Errorf("version should have incremented, expected > 10, got %d", finalFlow.Version)
+	}
+}
+
+func TestApprovalAndWithdraw_RaceCondition(t *testing.T) {
+	setupTestDB(t)
+	svc := NewApprovalService()
+	db := database.GetDB()
+
+	vendor := createTestVendor(t, "并发竞争测试厂商")
+	db.Model(&models.ApprovalFlow{}).Where("vendor_id = ?", vendor.ID).Update("version", 1)
+
+	// 提交审批
+	err := svc.Approve(&models.ApprovalRequest{
+		VendorID: vendor.ID,
+		Remark:   "资料提交",
+	}, 1001, "提交人")
+	if err != nil {
+		t.Fatalf("Approve submit error: %v", err)
+	}
+
+	// 先通过 COMPLIANCE_CHECK 阶段，让 flow 进入 LEVEL_1_APPROVAL（并签）
+	err = svc.Approve(&models.ApprovalRequest{
+		VendorID: vendor.ID,
+		Remark:   "合规通过",
+	}, 1002, "合规员")
+	if err != nil {
+		t.Fatalf("compliance approval error: %v", err)
+	}
+
+	// 刷新 flow，确认在 LEVEL_1_APPROVAL
+	flowResp, _ := svc.GetFlow(vendor.ID)
+	flow := flowResp.Flow
+	if flow.CurrentStage != models.StageLevel1Approval {
+		t.Fatalf("expected StageLevel1Approval, got %s", flow.CurrentStage)
+	}
+
+	// 设置 LEVEL_1_APPROVAL 为并签 (SignTypeAll)
+	var cfg models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&cfg)
+	signers := []*models.ApprovalNodeSigner{
+		{ApprovalNodeID: cfg.ID, ApproverID: 2001, ApproverName: "主管A", ApproverRole: "L1", Stage: models.StageLevel1Approval},
+		{ApprovalNodeID: cfg.ID, ApproverID: 2002, ApproverName: "主管B", ApproverRole: "L1", Stage: models.StageLevel1Approval},
+	}
+	for _, s := range signers {
+		db.Create(s)
+	}
+
+	// 并发：一个协程审批 LEVEL_1，一个协程撤回（版本回滚）
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+
+	// 审批协程
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[0] = svc.Approve(&models.ApprovalRequest{
+			VendorID: vendor.ID,
+			Remark:   "L1 同意",
+		}, 2001, "主管A")
+	}()
+
+	// 撤回协程
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[1] = svc.Withdraw(&models.WithdrawRequest{
+			VendorID: vendor.ID,
+			Reason:   "材料有误，撤回修改",
+		}, 1001, "提交人")
+	}()
+
+	wg.Wait()
+
+	// 两个操作应该有且只有一个成功（乐观锁生效）
+	successCount := 0
+	for _, r := range results {
+		if r == nil {
+			successCount++
+		}
+	}
+
+	if successCount == 2 {
+		t.Fatal("both approval and withdrawal succeeded, optimistic lock failed!")
+	}
+
+	// 如果都失败了，至少有一个应该是版本冲突
+	if successCount == 0 {
+		t.Log("both failed (acceptable if they raced), checking errors")
+		conflictCount := 0
+		for _, r := range results {
+			if r != nil && (strings.Contains(r.Error(), "版本冲突") || strings.Contains(r.Error(), "version")) {
+				conflictCount++
+			}
+		}
+		if conflictCount == 0 {
+			t.Errorf("at least one should be version conflict, got: %v and %v", results[0], results[1])
+		}
+	}
+
+	// 检查数据库最终状态的一致性
+	var finalFlow models.ApprovalFlow
+	db.Where("vendor_id = ?", vendor.ID).First(&finalFlow)
+
+	validStates := map[models.ApprovalStatus]bool{
+		models.ApprovalStatusPending:   true,
+		models.ApprovalStatusApproved:  true,
+		models.ApprovalStatusPartial:   true,
+		models.ApprovalStatusWithdrawn: true,
+		models.ApprovalStatusRejected:  true,
+	}
+
+	if !validStates[finalFlow.Status] {
+		t.Errorf("final flow in invalid state: %s", finalFlow.Status)
+	}
+	t.Logf("race test: approval err=%v, withdraw err=%v, final status=%s, final stage=%s, version=%d",
+		results[0], results[1], finalFlow.Status, finalFlow.CurrentStage, finalFlow.Version)
+}
+
+

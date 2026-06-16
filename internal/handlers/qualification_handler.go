@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,132 +27,75 @@ func NewQualificationHandler() *QualificationHandler {
 }
 
 func (h *QualificationHandler) Upload(c *gin.Context) {
-	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	vendorID, req, err := h.qualificationService.BindUpload(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的供应商ID")
+		utils.WriteError(c, err)
 		return
 	}
-
-	var req models.QualificationUploadRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
-		return
-	}
-
-	q, err := h.qualificationService.Upload(vendorID, &req)
+	q, err := h.qualificationService.Upload(vendorID, req)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, q)
 }
 
 func (h *QualificationHandler) UploadFile(c *gin.Context) {
-	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	vendorID, req, opts, err := h.qualificationService.BindUploadFile(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的供应商ID")
+		utils.WriteError(c, err)
 		return
 	}
-
-	file, err := c.FormFile("file")
-	if err != nil {
-		utils.BadRequest(c, "缺少文件字段 file: "+err.Error())
-		return
-	}
-
-	qTypeStr := c.PostForm("type")
-	if qTypeStr == "" {
-		utils.BadRequest(c, "缺少 type 字段")
-		return
-	}
-	qType := models.QualificationType(qTypeStr)
-
-	name := c.PostForm("name")
-	if name == "" {
-		name = file.Filename
-	}
-	number := c.PostForm("number")
-	issuedBy := c.PostForm("issued_by")
-
-	var issuedDate *time.Time
-	if v := c.PostForm("issued_date"); v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			issuedDate = &t
-		}
-	}
-	var expiryDate *time.Time
-	if v := c.PostForm("expiry_date"); v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			expiryDate = &t
-		}
-	}
-
-	opts := services.DefaultProcessOptions()
-	if v := c.PostForm("skip_virus_scan"); v == "1" || v == "true" {
-		opts.SkipVirusScan = true
-	}
-	if v := c.PostForm("skip_image_crop"); v == "1" || v == "true" {
-		opts.SkipImageCrop = true
-	}
-	if v := c.PostForm("skip_pdf_sanitize"); v == "1" || v == "true" {
-		opts.SkipPDFSanitize = true
-	}
-
 	result, err := h.fileServiceV2.UploadQualificationFile(
 		c.Request.Context(),
-		vendorID, file, qType, name, number, issuedBy, issuedDate, expiryDate, opts,
+		vendorID, req.File, req.Type, req.Name, req.Number, req.IssuedBy,
+		req.IssuedDate, req.ExpiryDate, opts,
 	)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, result)
 }
 
 func (h *QualificationHandler) ListByVendor(c *gin.Context) {
-	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	vendorID, _, err := h.qualificationService.BindListOrDelete(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的供应商ID")
+		utils.WriteError(c, err)
 		return
 	}
-
 	list, err := h.qualificationService.GetByVendorID(vendorID)
 	if err != nil {
 		utils.InternalError(c, "查询失败")
 		return
 	}
-
 	utils.Success(c, list)
 }
 
 func (h *QualificationHandler) Get(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, err := strconv.ParseUint(c.Param("qid"), 10, 64)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.BadRequest(c, "无效的资质ID")
 		return
 	}
-
 	q, err := h.qualificationService.GetByID(id)
 	if err != nil {
 		utils.NotFound(c, "资质文件不存在")
 		return
 	}
-
 	utils.Success(c, q)
 }
 
 func (h *QualificationHandler) Verify(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, err := strconv.ParseUint(c.Param("qid"), 10, 64)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.BadRequest(c, "无效的资质ID")
 		return
 	}
 
 	var req models.QualificationVerifyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	if _, err := services.BindAndValidate(c, &req); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
 
@@ -165,24 +107,25 @@ func (h *QualificationHandler) Verify(c *gin.Context) {
 
 	q, err := h.qualificationService.Verify(id, uid, &req)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, q)
 }
 
 func (h *QualificationHandler) Delete(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	_, qID, err := h.qualificationService.BindListOrDelete(c)
 	if err != nil {
-		utils.BadRequest(c, "无效的ID")
+		utils.WriteError(c, err)
 		return
 	}
-
-	if err := h.qualificationService.Delete(id); err != nil {
-		utils.BadRequest(c, err.Error())
+	if qID == 0 {
+		utils.BadRequest(c, "缺少资质ID")
 		return
 	}
-
+	if err := h.qualificationService.Delete(qID); err != nil {
+		utils.WriteError(c, err)
+		return
+	}
 	utils.Success(c, gin.H{"message": "删除成功"})
 }

@@ -1,8 +1,8 @@
 package services
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -13,9 +13,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"golang.org/x/image/draw"
+
+	"vendor-onboarding-api/internal/scanner"
 )
+
+var defaultScanner = scanner.NewDefaultScanner()
+
+func SetVirusScanner(s scanner.Scanner) {
+	defaultScanner = s
+}
 
 type ProcessingStep string
 
@@ -33,6 +42,7 @@ type ProcessOptions struct {
 	MaxImageWidth   int
 	MaxImageHeight  int
 	ImageQuality    int
+	ScannerTimeout  time.Duration
 }
 
 func DefaultProcessOptions() ProcessOptions {
@@ -40,9 +50,10 @@ func DefaultProcessOptions() ProcessOptions {
 		SkipVirusScan:   false,
 		SkipImageCrop:   false,
 		SkipPDFSanitize: false,
-		MaxImageWidth:   3000,
-		MaxImageHeight:  3000,
+		MaxImageWidth:   1920,
+		MaxImageHeight:  1920,
 		ImageQuality:    85,
+		ScannerTimeout:  10 * time.Second,
 	}
 }
 
@@ -52,6 +63,78 @@ type ProcessResult struct {
 	NewSize int64            `json:"new_size"`
 	WasInfected bool         `json:"was_infected"`
 	CropApplied bool         `json:"crop_applied"`
+	Threats   []string       `json:"threats"`
+	ScanInfo  *scanner.ScanResult `json:"scan_info,omitempty"`
+}
+
+func ProcessFileChain(ctx context.Context, srcPath string, ext string, opts ProcessOptions) (*ProcessResult, error) {
+	result := &ProcessResult{}
+	ext = strings.ToLower(ext)
+
+	if !opts.SkipVirusScan {
+		scanCtx := ctx
+		var cancel context.CancelFunc
+		if opts.ScannerTimeout > 0 {
+			scanCtx, cancel = context.WithTimeout(ctx, opts.ScannerTimeout)
+			defer cancel()
+		}
+		scanResult, err := defaultScanner.Scan(scanCtx, srcPath, ext)
+		if err != nil {
+			return nil, fmt.Errorf("virus scan failed: %w", err)
+		}
+		result.ScanInfo = scanResult
+		if !scanResult.Clean {
+			result.WasInfected = true
+			result.Threats = scanResult.Threats
+			return result, fmt.Errorf("virus detected: %v", scanResult.Threats)
+		}
+		result.Applied = append(result.Applied, StepVirusScan)
+	} else {
+		result.Skipped = append(result.Skipped, StepVirusScan)
+	}
+
+	isImage := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true}
+	isPDF := ext == ".pdf"
+
+	if isImage[ext] && !opts.SkipImageCrop {
+		dstPath := srcPath + ".processed" + ext
+		applied, err := CropAndResizeImage(srcPath, dstPath,
+			opts.MaxImageWidth, opts.MaxImageHeight, opts.ImageQuality)
+		if err != nil {
+			return result, fmt.Errorf("image crop failed: %w", err)
+		}
+		if applied {
+			_ = os.Rename(dstPath, srcPath)
+			result.CropApplied = true
+			result.Applied = append(result.Applied, StepImageCrop)
+			if info, err := os.Stat(srcPath); err == nil {
+				result.NewSize = info.Size()
+			}
+		} else {
+			_ = os.Remove(dstPath)
+			result.Skipped = append(result.Skipped, StepImageCrop)
+		}
+	}
+
+	if isPDF && !opts.SkipPDFSanitize {
+		dstPath := srcPath + ".sanitized.pdf"
+		applied, err := SanitizePDF(srcPath, dstPath)
+		if err != nil {
+			return result, fmt.Errorf("pdf sanitize failed: %w", err)
+		}
+		if applied {
+			_ = os.Rename(dstPath, srcPath)
+			result.Applied = append(result.Applied, StepPDFSanitize)
+			if info, err := os.Stat(srcPath); err == nil {
+				result.NewSize = info.Size()
+			}
+		} else {
+			_ = os.Remove(dstPath)
+			result.Skipped = append(result.Skipped, StepPDFSanitize)
+		}
+	}
+
+	return result, nil
 }
 
 var virusSignaturePatterns = []*regexp.Regexp{
@@ -69,46 +152,15 @@ var virusSignaturePatterns = []*regexp.Regexp{
 }
 
 func ScanVirus(path string, ext string) (bool, []string, error) {
-	if isScriptExtension(ext) {
-		return true, []string{"script extension detected: " + ext}, nil
-	}
-
-	f, err := os.Open(path)
+	result, err := defaultScanner.Scan(context.Background(), path, ext)
 	if err != nil {
 		return false, nil, err
 	}
-	defer f.Close()
+	return !result.Clean, result.Threats, nil
+}
 
-	headBuf := make([]byte, 512)
-	n, _ := f.Read(headBuf)
-	headBuf = headBuf[:n]
-
-	magic := detectMagic(headBuf)
-	if magic == "exe" || magic == "elf" || magic == "macho" || magic == "batch" || magic == "shell" {
-		return true, []string{"forbidden executable magic bytes: " + magic}, nil
-	}
-
-	_, _ = f.Seek(0, io.SeekStart)
-
-	var found []string
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-	lineCount := 0
-	for scanner.Scan() && lineCount < 20000 {
-		line := scanner.Bytes()
-		for _, pat := range virusSignaturePatterns {
-			if pat.Match(bytes.ToLower(line)) {
-				found = append(found, fmt.Sprintf("pattern hit at line %d: %s", lineCount, pat.String()))
-				if len(found) >= 5 {
-					return true, found, nil
-				}
-			}
-		}
-		lineCount++
-	}
-
-	return len(found) > 0, found, nil
+func ScanVirusWithContext(ctx context.Context, path string, ext string) (*scanner.ScanResult, error) {
+	return defaultScanner.Scan(ctx, path, ext)
 }
 
 func isScriptExtension(ext string) bool {

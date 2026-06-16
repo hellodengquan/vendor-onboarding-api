@@ -1,11 +1,8 @@
 package handlers
 
 import (
-	"strconv"
-
 	"github.com/gin-gonic/gin"
 
-	"vendor-onboarding-api/internal/models"
 	"vendor-onboarding-api/internal/services"
 	"vendor-onboarding-api/pkg/utils"
 )
@@ -19,18 +16,14 @@ func NewAPIKeyHandler() *APIKeyHandler {
 }
 
 func (h *APIKeyHandler) Create(c *gin.Context) {
-	type req struct {
-		AppKey string `json:"app_key"`
-		Remark string `json:"remark"`
-	}
-	var r req
-	if err := c.ShouldBindJSON(&r); err != nil {
-		utils.BadRequest(c, err.Error())
+	req, err := h.svc.BindCreate(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-	key, secret, err := h.svc.Create(r.AppKey, r.Remark)
+	key, secret, err := h.svc.Create(req.AppKey, req.Description)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, gin.H{
@@ -53,18 +46,18 @@ func (h *APIKeyHandler) List(c *gin.Context) {
 }
 
 func (h *APIKeyHandler) Rotate(c *gin.Context) {
-	var req models.APIKeyRotateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, err.Error())
+	req, err := h.svc.BindRotate(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-	hours := req.OldVersion
+	hours := req.ExpireOldHours
 	if hours <= 0 {
-		hours = 24
+		hours = 72
 	}
 	key, newSecret, err := h.svc.Rotate(req.AppKey, hours, req.Remark)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, gin.H{
@@ -77,11 +70,9 @@ func (h *APIKeyHandler) Rotate(c *gin.Context) {
 }
 
 func (h *APIKeyHandler) Revoke(c *gin.Context) {
-	appKey := c.Param("app_key")
-	versionStr := c.Query("version")
-	version, err := strconv.Atoi(versionStr)
+	appKey, version, err := h.svc.BindRevoke(c)
 	if err != nil {
-		utils.BadRequest(c, "invalid version")
+		utils.WriteError(c, err)
 		return
 	}
 	if err := h.svc.Revoke(appKey, version); err != nil {
@@ -92,10 +83,13 @@ func (h *APIKeyHandler) Revoke(c *gin.Context) {
 }
 
 func (h *APIKeyHandler) Cleanup(c *gin.Context) {
-	n, err := h.svc.CleanupExpired()
+	rotated, purged, err := h.svc.CleanupExpiredFull(90)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
 	}
-	utils.Success(c, gin.H{"cleaned_count": n})
+	utils.Success(c, gin.H{
+		"rotated_expired": rotated,
+		"revoked_purged":  purged,
+	})
 }

@@ -36,6 +36,10 @@ func (errs *ValidationErrors) Add(field, msg, code string) {
 	*errs = append(*errs, &ValidationError{Field: field, Message: msg, Code: code})
 }
 
+func NewValidationError(field, msg, code string) ValidationErrors {
+	return ValidationErrors{&ValidationError{Field: field, Message: msg, Code: code}}
+}
+
 type VendorValidator struct{}
 
 func NewVendorValidator() *VendorValidator { return &VendorValidator{} }
@@ -141,6 +145,19 @@ func (v *VendorValidator) ValidateSubmit(id uint64) error {
 	}
 	if errs.HasErrors() {
 		return errs
+	}
+	return nil
+}
+
+func (v *VendorValidator) ValidateID(id uint64) error {
+	if id == 0 {
+		return NewValidationError("id", "ID 不能为 0", "INVALID_ID")
+	}
+	db := database.GetDB()
+	var count int64
+	db.Model(&models.Vendor{}).Where("id = ?", id).Count(&count)
+	if count == 0 {
+		return NewValidationError("id", "供应商不存在", "NOT_FOUND")
 	}
 	return nil
 }

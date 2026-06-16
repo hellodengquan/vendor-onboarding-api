@@ -138,3 +138,51 @@ func (s *LocalStorage) KeyFromURL(publicURL string) (string, error) {
 	}
 	return "", errors.New("url does not belong to this storage")
 }
+
+func (s *LocalStorage) List(ctx context.Context, prefix string) ([]FileInfo, error) {
+	var out []FileInfo
+	root := s.rootDir
+	scanPrefix := ""
+	if prefix != "" {
+		scanPrefix = filepath.FromSlash(prefix)
+		root = filepath.Join(s.rootDir, scanPrefix)
+	}
+
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return out, nil
+	}
+
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(s.rootDir, path)
+		if err != nil {
+			return nil
+		}
+		key := filepath.ToSlash(rel)
+		if scanPrefix != "" && !strings.HasPrefix(key, filepath.ToSlash(scanPrefix)) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		out = append(out, FileInfo{
+			Key:          key,
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

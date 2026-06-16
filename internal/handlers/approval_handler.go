@@ -26,104 +26,65 @@ func (h *ApprovalHandler) GetFlow(c *gin.Context) {
 		utils.BadRequest(c, "无效的供应商ID")
 		return
 	}
-
 	result, err := h.approvalService.GetFlow(vendorID)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, result)
 }
 
 func (h *ApprovalHandler) Approve(c *gin.Context) {
-	var req models.ApprovalRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	_, req, err := h.approvalService.BindApprove(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
-	approverID, _ := c.Get("user_id")
-	approverName, _ := c.Get("user_name")
-	var uid uint64 = 0
-	var uname string = ""
-	if approverID != nil {
-		uid = approverID.(uint64)
-	}
-	if approverName != nil {
-		uname = approverName.(string)
-	}
-
-	if err := h.approvalService.Approve(&req, uid, uname); err != nil {
-		utils.BadRequest(c, err.Error())
+	uid, uname := extractUser(c)
+	if err := h.approvalService.Approve(req, uid, uname); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, gin.H{"message": "审批通过"})
 }
 
 func (h *ApprovalHandler) Reject(c *gin.Context) {
-	var req models.ApprovalRejectRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	_, req, err := h.approvalService.BindReject(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
-	approverID, _ := c.Get("user_id")
-	approverName, _ := c.Get("user_name")
-	var uid uint64 = 0
-	var uname string = ""
-	if approverID != nil {
-		uid = approverID.(uint64)
-	}
-	if approverName != nil {
-		uname = approverName.(string)
-	}
-
-	if err := h.approvalService.Reject(&req, uid, uname); err != nil {
-		utils.BadRequest(c, err.Error())
+	uid, uname := extractUser(c)
+	if err := h.approvalService.Reject(req, uid, uname); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, gin.H{"message": "已驳回"})
 }
 
 func (h *ApprovalHandler) Transition(c *gin.Context) {
-	var req models.StageTransitionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	_, req, err := h.approvalService.BindTransition(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
-	operatorID, _ := c.Get("user_id")
-	operatorName, _ := c.Get("user_name")
-	var uid uint64 = 0
-	var uname string = ""
-	if operatorID != nil {
-		uid = operatorID.(uint64)
-	}
-	if operatorName != nil {
-		uname = operatorName.(string)
-	}
-
-	if err := h.approvalService.Transition(&req, uid, uname); err != nil {
-		utils.BadRequest(c, err.Error())
+	uid, uname := extractUser(c)
+	if err := h.approvalService.Transition(req, uid, uname); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	utils.Success(c, gin.H{"message": "阶段流转成功"})
 }
 
 func (h *ApprovalHandler) CreateNodeConfig(c *gin.Context) {
 	var req models.NodeConfigCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	if _, err := services.BindAndValidate(c, &req); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	node, err := h.approvalService.CreateNodeConfig(&req)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, node)
@@ -149,40 +110,37 @@ func (h *ApprovalHandler) GetStageSignStatus(c *gin.Context) {
 		utils.BadRequest(c, "缺少阶段参数")
 		return
 	}
-
 	status, err := h.approvalService.GetStageSignStatus(vendorID, stage)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, status)
 }
 
 func (h *ApprovalHandler) AddSigner(c *gin.Context) {
-	var req models.AddSignerRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	_, req, err := h.approvalService.BindAddSigner(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	uid, uname := extractUser(c)
-	if err := h.approvalService.AddSigner(&req, uid, uname); err != nil {
-		utils.BadRequest(c, err.Error())
+	if err := h.approvalService.AddSigner(req, uid, uname); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, gin.H{"message": "加签成功"})
 }
 
 func (h *ApprovalHandler) Withdraw(c *gin.Context) {
-	var req models.WithdrawRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	_, req, err := h.approvalService.BindWithdraw(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-
 	uid, uname := extractUser(c)
-	if err := h.approvalService.Withdraw(&req, uid, uname); err != nil {
-		utils.BadRequest(c, err.Error())
+	if err := h.approvalService.Withdraw(req, uid, uname); err != nil {
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, gin.H{"message": "撤回成功", "to_stage": req.ToStage})
@@ -203,14 +161,14 @@ func (h *ApprovalHandler) ListWithdrawals(c *gin.Context) {
 }
 
 func (h *ApprovalHandler) CreateParallelGroup(c *gin.Context) {
-	var req models.ParallelGroupCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "参数错误: "+err.Error())
+	req, err := h.approvalService.BindParallelGroup(c)
+	if err != nil {
+		utils.WriteError(c, err)
 		return
 	}
-	group, err := h.approvalService.CreateParallelGroup(&req)
+	group, err := h.approvalService.CreateParallelGroup(req)
 	if err != nil {
-		utils.BadRequest(c, err.Error())
+		utils.WriteError(c, err)
 		return
 	}
 	utils.Success(c, group)

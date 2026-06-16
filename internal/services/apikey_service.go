@@ -1,10 +1,12 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,7 +15,11 @@ import (
 	"vendor-onboarding-api/internal/models"
 )
 
-type APIKeyService struct{}
+type APIKeyService struct {
+	cancelCleanup context.CancelFunc
+	cleanupWG     sync.WaitGroup
+	cleanupMu     sync.Mutex
+}
 
 func NewAPIKeyService() *APIKeyService {
 	return &APIKeyService{}
@@ -149,6 +155,74 @@ func (s *APIKeyService) CleanupExpired() (int64, error) {
 	res := db.Where("status = ? AND expire_at IS NOT NULL AND expire_at < ?", "ROTATING", time.Now()).
 		Update("status", "EXPIRED")
 	return res.RowsAffected, res.Error
+}
+
+func (s *APIKeyService) CleanupExpiredFull(gracePeriodDays int) (rotatedExpired int64, revokedPurged int64, err error) {
+	db := database.GetDB()
+
+	if gracePeriodDays <= 0 {
+		gracePeriodDays = 90
+	}
+	cutoff := time.Now().AddDate(0, 0, -gracePeriodDays)
+
+	res1 := db.Where("status = ? AND expire_at IS NOT NULL AND expire_at < ?", "ROTATING", time.Now()).
+		Update("status", "EXPIRED")
+	if res1.Error != nil {
+		return 0, 0, res1.Error
+	}
+	rotatedExpired = res1.RowsAffected
+
+	res2 := db.Where("status IN ? AND updated_at < ?",
+		[]string{"EXPIRED", "REVOKED"}, cutoff).
+		Delete(&models.APIKey{})
+	if res2.Error != nil {
+		return rotatedExpired, 0, res2.Error
+	}
+	revokedPurged = res2.RowsAffected
+	return rotatedExpired, revokedPurged, nil
+}
+
+func (s *APIKeyService) StartAutoCleanup(ctx context.Context, interval time.Duration, gracePeriodDays int) {
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+
+	if s.cancelCleanup != nil {
+		s.cancelCleanup()
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancelCleanup = cancel
+
+	s.cleanupWG.Add(1)
+	go func() {
+		defer s.cleanupWG.Done()
+		if interval <= 0 {
+			interval = 1 * time.Hour
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				_, _, _ = s.CleanupExpiredFull(gracePeriodDays)
+			}
+		}
+	}()
+}
+
+func (s *APIKeyService) StopAutoCleanup() {
+	s.cleanupMu.Lock()
+	cancel := s.cancelCleanup
+	s.cancelCleanup = nil
+	s.cleanupMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	s.cleanupWG.Wait()
 }
 
 func generateSecret(n int) (string, error) {
