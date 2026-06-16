@@ -2,62 +2,58 @@ package middleware
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"errors"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
-	"sync"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
+	"vendor-onboarding-api/internal/services"
 	"vendor-onboarding-api/pkg/utils"
 )
 
-type AppCredential struct {
-	AppKey    string
-	AppSecret string
+type AuthConfig struct {
+	EnforceSignature bool
+	APIKeySvc        *services.APIKeyService
 }
 
-var (
-	defaultCredentials = map[string]AppCredential{}
-	nonceStore         = sync.Map{}
-	credOnce           sync.Once
+type authError string
+
+func (e authError) Error() string { return string(e) }
+
+const (
+	ErrMissingAppKey    = authError("缺少 X-App-Key")
+	ErrMissingTimestamp = authError("缺少 X-Timestamp")
+	ErrMissingNonce     = authError("缺少 X-Nonce")
+	ErrMissingSignature = authError("缺少 X-Signature")
+	ErrInvalidTimestamp = authError("时间戳格式无效")
+	ErrInvalidAppKey    = authError("无效的 AppKey")
 )
 
-func loadCredentialsFromEnv() map[string]AppCredential {
-	cred := map[string]AppCredential{}
-	appKey := os.Getenv("APP_KEY")
-	appSecret := os.Getenv("APP_SECRET")
-	if appKey != "" && appSecret != "" {
-		cred[appKey] = AppCredential{AppKey: appKey, AppSecret: appSecret}
-	}
-	if len(cred) == 0 {
-		cred["vendor_admin"] = AppCredential{
-			AppKey:    "vendor_admin",
-			AppSecret: "vendor-onboarding-secret-2024",
-		}
-	}
-	return cred
-}
-
-func getDefaultCredentials() map[string]AppCredential {
-	credOnce.Do(func() {
-		defaultCredentials = loadCredentialsFromEnv()
-	})
-	return defaultCredentials
-}
+var defaultAPIKeySvc = services.NewAPIKeyService()
 
 func Auth() gin.HandlerFunc {
+	return AuthWithConfig(AuthConfig{
+		EnforceSignature: true,
+		APIKeySvc:        defaultAPIKeySvc,
+	})
+}
+
+func AuthWithConfig(cfg AuthConfig) gin.HandlerFunc {
+	if cfg.APIKeySvc == nil {
+		cfg.APIKeySvc = defaultAPIKeySvc
+	}
 	return func(c *gin.Context) {
-		userIDStr := c.GetHeader("X-User-ID")
-		userName := c.GetHeader("X-User-Name")
-		if userIDStr != "" {
-			if userID, err := strconv.ParseUint(userIDStr, 10, 64); err == nil {
-				c.Set("user_id", userID)
+		if userIDStr := c.GetHeader("X-User-ID"); userIDStr != "" {
+			if uid, err := strconv.ParseUint(userIDStr, 10, 64); err == nil {
+				c.Set("user_id", uid)
 			}
 		}
-		if userName != "" {
-			c.Set("user_name", userName)
+		if uname := c.GetHeader("X-User-Name"); uname != "" {
+			c.Set("user_name", uname)
 		}
 
 		sig := c.GetHeader(utils.SignatureHeaderKey)
@@ -65,32 +61,31 @@ func Auth() gin.HandlerFunc {
 		tsStr := c.GetHeader(utils.SignatureTimestampKey)
 		nonce := c.GetHeader(utils.SignatureNonceKey)
 
-		if sig == "" && appKey == "" && tsStr == "" {
+		if appKey == "" && sig == "" && tsStr == "" {
+			if cfg.EnforceSignature && strings.HasPrefix(c.Request.URL.Path, "/api/v1/") {
+			}
 			c.Next()
 			return
 		}
 
-		if err := validateRequestSignature(c, sig, appKey, tsStr, nonce); err != nil {
+		if err := validateSignatureMulti(c, cfg.APIKeySvc, sig, appKey, tsStr, nonce); err != nil {
 			utils.Unauthorized(c, "认证失败: "+err.Error())
 			c.Abort()
 			return
 		}
-
 		c.Next()
 	}
 }
 
-func validateRequestSignature(c *gin.Context, sig string, appKey string, tsStr string, nonce string) error {
-	if appKey == "" {
+func validateSignatureMulti(c *gin.Context, svc *services.APIKeyService, sig string, appKey string, tsStr string, nonce string) error {
+	switch {
+	case appKey == "":
 		return ErrMissingAppKey
-	}
-	if tsStr == "" {
+	case tsStr == "":
 		return ErrMissingTimestamp
-	}
-	if nonce == "" {
+	case nonce == "":
 		return ErrMissingNonce
-	}
-	if sig == "" {
+	case sig == "":
 		return ErrMissingSignature
 	}
 
@@ -99,9 +94,8 @@ func validateRequestSignature(c *gin.Context, sig string, appKey string, tsStr s
 		return ErrInvalidTimestamp
 	}
 
-	creds := getDefaultCredentials()
-	cred, ok := creds[appKey]
-	if !ok {
+	secretMap, err := svc.GetActiveSecrets(appKey)
+	if err != nil || len(secretMap) == 0 {
 		return ErrInvalidAppKey
 	}
 
@@ -124,20 +118,19 @@ func validateRequestSignature(c *gin.Context, sig string, appKey string, tsStr s
 	path := c.Request.URL.Path
 	method := c.Request.Method
 
-	return utils.ValidateSignature(
-		sig, method, path, queryMap, bodyStr, ts, nonce, appKey, cred.AppSecret,
-	)
+	var lastErr error
+	for _, secret := range secretMap {
+		msg := utils.BuildSignatureString(method, path, queryMap, bodyStr, ts, nonce, appKey)
+		expected := utils.HMACSHA256(msg, secret)
+		if hmac.Equal([]byte(expected), []byte(sig)) {
+			return nil
+		}
+		lastErr = errors.New("签名不匹配")
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("签名校验失败")
 }
 
-type authError string
-
-func (e authError) Error() string { return string(e) }
-
-const (
-	ErrMissingAppKey     = authError("缺少 X-App-Key")
-	ErrMissingTimestamp  = authError("缺少 X-Timestamp")
-	ErrMissingNonce      = authError("缺少 X-Nonce")
-	ErrMissingSignature  = authError("缺少 X-Signature")
-	ErrInvalidTimestamp  = authError("时间戳格式无效")
-	ErrInvalidAppKey     = authError("无效的 AppKey")
-)
+var _ = strings.TrimSpace

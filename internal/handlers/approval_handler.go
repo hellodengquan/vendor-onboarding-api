@@ -157,3 +157,73 @@ func (h *ApprovalHandler) GetStageSignStatus(c *gin.Context) {
 	}
 	utils.Success(c, status)
 }
+
+func (h *ApprovalHandler) AddSigner(c *gin.Context) {
+	var req models.AddSignerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+
+	uid, uname := extractUser(c)
+	if err := h.approvalService.AddSigner(&req, uid, uname); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"message": "加签成功"})
+}
+
+func (h *ApprovalHandler) Withdraw(c *gin.Context) {
+	var req models.WithdrawRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+
+	uid, uname := extractUser(c)
+	if err := h.approvalService.Withdraw(&req, uid, uname); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"message": "撤回成功", "to_stage": req.ToStage})
+}
+
+func (h *ApprovalHandler) ListWithdrawals(c *gin.Context) {
+	vendorID, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
+	if err != nil {
+		utils.BadRequest(c, "无效的供应商ID")
+		return
+	}
+	list, err := h.approvalService.ListWithdrawals(vendorID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, list)
+}
+
+func (h *ApprovalHandler) CreateParallelGroup(c *gin.Context) {
+	var req models.ParallelGroupCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+	group, err := h.approvalService.CreateParallelGroup(&req)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, group)
+}
+
+func extractUser(c *gin.Context) (uint64, string) {
+	var uid uint64 = 0
+	var uname string = ""
+	if v, ok := c.Get("user_id"); ok && v != nil {
+		uid = v.(uint64)
+	}
+	if v, ok := c.Get("user_name"); ok && v != nil {
+		uname = v.(string)
+	}
+	return uid, uname
+}

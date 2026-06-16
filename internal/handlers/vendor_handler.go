@@ -37,7 +37,7 @@ func (h *VendorHandler) Create(c *gin.Context) {
 }
 
 func (h *VendorHandler) Get(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
 	if err != nil {
 		utils.BadRequest(c, "无效的ID")
 		return
@@ -76,7 +76,7 @@ func (h *VendorHandler) List(c *gin.Context) {
 }
 
 func (h *VendorHandler) Update(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
 	if err != nil {
 		utils.BadRequest(c, "无效的ID")
 		return
@@ -98,7 +98,7 @@ func (h *VendorHandler) Update(c *gin.Context) {
 }
 
 func (h *VendorHandler) Submit(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, err := strconv.ParseUint(c.Param("vendor_id"), 10, 64)
 	if err != nil {
 		utils.BadRequest(c, "无效的ID")
 		return

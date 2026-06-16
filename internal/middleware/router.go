@@ -9,18 +9,21 @@ import (
 
 	"vendor-onboarding-api/internal/handlers"
 	"vendor-onboarding-api/internal/services"
+	"vendor-onboarding-api/internal/storage"
 	"vendor-onboarding-api/pkg/utils"
 )
 
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
 
-	fileService := services.NewFileService()
-	uploadDir := fileService.GetUploadDir()
-	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
-		os.MkdirAll(uploadDir, 0755)
+	store, _ := storage.NewStorageFromEnv()
+	if store != nil && store.Name() == "local" {
+		uploadDir := services.NewFileService().GetUploadDir()
+		if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+			os.MkdirAll(uploadDir, 0755)
+		}
+		r.Static("/uploads", uploadDir)
 	}
-	r.Static("/uploads", uploadDir)
 
 	r.Use(CORS())
 	r.Use(Auth())
@@ -29,6 +32,7 @@ func SetupRouter() *gin.Engine {
 	qualificationHandler := handlers.NewQualificationHandler()
 	complianceHandler := handlers.NewComplianceHandler()
 	approvalHandler := handlers.NewApprovalHandler()
+	apiKeyHandler := handlers.NewAPIKeyHandler()
 
 	api := r.Group("/api/v1")
 	{
@@ -40,13 +44,27 @@ func SetupRouter() *gin.Engine {
 			approvalNodes.GET("", approvalHandler.ListNodeConfigs)
 		}
 
+		parallelGroups := api.Group("/approval-parallel-groups")
+		{
+			parallelGroups.POST("", approvalHandler.CreateParallelGroup)
+		}
+
+		apiKeys := api.Group("/api-keys")
+		{
+			apiKeys.POST("", apiKeyHandler.Create)
+			apiKeys.GET("", apiKeyHandler.List)
+			apiKeys.POST("/rotate", apiKeyHandler.Rotate)
+			apiKeys.DELETE("/:app_key", apiKeyHandler.Revoke)
+			apiKeys.POST("/cleanup", apiKeyHandler.Cleanup)
+		}
+
 		vendors := api.Group("/vendors")
 		{
 			vendors.POST("", vendorHandler.Create)
 			vendors.GET("", vendorHandler.List)
-			vendors.GET("/:id", vendorHandler.Get)
-			vendors.PUT("/:id", vendorHandler.Update)
-			vendors.POST("/:id/submit", vendorHandler.Submit)
+			vendors.GET("/:vendor_id", vendorHandler.Get)
+			vendors.PUT("/:vendor_id", vendorHandler.Update)
+			vendors.POST("/:vendor_id/submit", vendorHandler.Submit)
 
 			qualifications := vendors.Group("/:vendor_id/qualifications")
 			{
@@ -67,6 +85,9 @@ func SetupRouter() *gin.Engine {
 				approval.POST("/approve", approvalHandler.Approve)
 				approval.POST("/reject", approvalHandler.Reject)
 				approval.POST("/transition", approvalHandler.Transition)
+				approval.POST("/add-signer", approvalHandler.AddSigner)
+				approval.POST("/withdraw", approvalHandler.Withdraw)
+				approval.GET("/withdrawals", approvalHandler.ListWithdrawals)
 			}
 		}
 

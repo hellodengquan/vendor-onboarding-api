@@ -8,18 +8,22 @@ import (
 
 	"vendor-onboarding-api/internal/models"
 	"vendor-onboarding-api/internal/services"
+	"vendor-onboarding-api/internal/storage"
 	"vendor-onboarding-api/pkg/utils"
 )
 
 type QualificationHandler struct {
 	qualificationService *services.QualificationService
 	fileService          *services.FileService
+	fileServiceV2        *services.FileServiceV2
 }
 
 func NewQualificationHandler() *QualificationHandler {
+	store, _ := storage.NewStorageFromEnv()
 	return &QualificationHandler{
 		qualificationService: services.NewQualificationService(),
 		fileService:          services.NewFileService(),
+		fileServiceV2:        services.NewFileServiceV2(store),
 	}
 }
 
@@ -85,8 +89,20 @@ func (h *QualificationHandler) UploadFile(c *gin.Context) {
 		}
 	}
 
-	result, err := h.fileService.UploadQualificationFile(
-		vendorID, file, qType, name, number, issuedBy, issuedDate, expiryDate,
+	opts := services.DefaultProcessOptions()
+	if v := c.PostForm("skip_virus_scan"); v == "1" || v == "true" {
+		opts.SkipVirusScan = true
+	}
+	if v := c.PostForm("skip_image_crop"); v == "1" || v == "true" {
+		opts.SkipImageCrop = true
+	}
+	if v := c.PostForm("skip_pdf_sanitize"); v == "1" || v == "true" {
+		opts.SkipPDFSanitize = true
+	}
+
+	result, err := h.fileServiceV2.UploadQualificationFile(
+		c.Request.Context(),
+		vendorID, file, qType, name, number, issuedBy, issuedDate, expiryDate, opts,
 	)
 	if err != nil {
 		utils.BadRequest(c, err.Error())

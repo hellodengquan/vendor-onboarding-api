@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -11,6 +12,7 @@ import (
 
 	"vendor-onboarding-api/internal/database"
 	"vendor-onboarding-api/internal/models"
+	"vendor-onboarding-api/pkg/utils"
 )
 
 func setupTestDB(t *testing.T) {
@@ -18,7 +20,7 @@ func setupTestDB(t *testing.T) {
 	dbPath := fmt.Sprintf("/tmp/voa_test_%d.db", os.Getpid())
 	os.Remove(dbPath)
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
@@ -32,6 +34,11 @@ func setupTestDB(t *testing.T) {
 		&models.ApprovalRecord{},
 		&models.ApprovalNodeConfig{},
 		&models.ApprovalNodeSigner{},
+		&models.ParallelGroup{},
+		&models.ParallelGroupInstance{},
+		&models.AdditionalSignerRecord{},
+		&models.WithdrawalRecord{},
+		&models.APIKey{},
 	)
 	if err != nil {
 		t.Fatalf("Failed to migrate: %v", err)
@@ -47,6 +54,8 @@ func setupTestDB(t *testing.T) {
 		{Stage: models.StageComplianceCheck, StageName: "合规性检查", Order: 1, SignType: models.SignTypeAny},
 		{Stage: models.StageLevel1Approval, StageName: "一级审批", Order: 2, SignType: models.SignTypeAll},
 		{Stage: models.StageLevel2Approval, StageName: "二级审批", Order: 3, SignType: models.SignTypeMajority},
+		{Stage: models.StageFinanceApproval, StageName: "财务审批", Order: 4, SignType: models.SignTypeAny},
+		{Stage: models.StageLegalApproval, StageName: "法务审批", Order: 5, SignType: models.SignTypeAny},
 	}
 	for _, s := range stages {
 		db.Create(&models.ApprovalNodeConfig{
@@ -238,10 +247,29 @@ func TestApprovalService_SignTypeMajority(t *testing.T) {
 	}
 
 	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID, Remark: "多数通过"}, 402, "副总B")
-	flowFinal, _ := service.GetFlow(vendor.ID)
+	flowPostL2, _ := service.GetFlow(vendor.ID)
 
+	if flowPostL2.Flow.CurrentStage != models.StageFinanceApproval {
+		t.Errorf("Expected FINANCE_APPROVAL after L2 majority (2/3) approval, got %s", flowPostL2.Flow.CurrentStage)
+	}
+
+	var financeCfg models.ApprovalNodeConfig
+	database.GetDB().Where("stage = ?", models.StageFinanceApproval).First(&financeCfg)
+	database.GetDB().Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: financeCfg.ID, ApproverID: 501, ApproverName: "财务1", Stage: models.StageFinanceApproval,
+	})
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 501, "财务1")
+
+	var legalCfg models.ApprovalNodeConfig
+	database.GetDB().Where("stage = ?", models.StageLegalApproval).First(&legalCfg)
+	database.GetDB().Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: legalCfg.ID, ApproverID: 601, ApproverName: "法务1", Stage: models.StageLegalApproval,
+	})
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 601, "法务1")
+
+	flowFinal, _ := service.GetFlow(vendor.ID)
 	if flowFinal.Flow.CurrentStage != models.StageCompleted {
-		t.Errorf("Expected COMPLETED after majority (2/3) approval, got %s", flowFinal.Flow.CurrentStage)
+		t.Errorf("Expected COMPLETED after finance+legal, got %s", flowFinal.Flow.CurrentStage)
 	}
 	if flowFinal.Vendor.Status != models.VendorStatusApproved {
 		t.Errorf("Expected vendor APPROVED, got %s", flowFinal.Vendor.Status)
@@ -432,5 +460,234 @@ func TestApprovalService_Transition_Manual(t *testing.T) {
 	}
 	if flow.Vendor.Status != models.VendorStatusApproved {
 		t.Errorf("Expected vendor APPROVED after transition")
+	}
+}
+
+func TestApprovalService_RejectAbortsFlow(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+	db := database.GetDB()
+
+	var l1 models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&l1)
+	for _, id := range []uint64{301, 302, 303} {
+		db.Create(&models.ApprovalNodeSigner{
+			ApprovalNodeID: l1.ID, ApproverID: id, ApproverName: "主管", Stage: models.StageLevel1Approval,
+		})
+	}
+
+	vendor := createTestVendor(t, "RejectAbort")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规快速")
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+	flow1, _ := service.GetFlow(vendor.ID)
+	if flow1.Flow.Status != models.ApprovalStatusPartial {
+		t.Errorf("should be PARTIAL after 1/3 approval")
+	}
+
+	err := service.Reject(&models.ApprovalRejectRequest{
+		VendorID: vendor.ID,
+		Remark:   "合同不合规",
+	}, 302, "主管2")
+	if err != nil {
+		t.Fatalf("reject error: %v", err)
+	}
+
+	flowFinal, _ := service.GetFlow(vendor.ID)
+	if flowFinal.Flow.Status != models.ApprovalStatusRejected {
+		t.Errorf("should be REJECTED after one signer rejected, got %s", flowFinal.Flow.Status)
+	}
+	if flowFinal.Vendor.Status != models.VendorStatusRejected {
+		t.Errorf("vendor should be REJECTED status, got %s", flowFinal.Vendor.Status)
+	}
+
+	err = service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 303, "主管3")
+	if err == nil {
+		t.Error("approve should fail after flow rejected")
+	}
+}
+
+func TestApprovalService_AddSigner_And_Withdraw(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+	db := database.GetDB()
+
+	var l1 models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&l1)
+	db.Create(&models.ApprovalNodeSigner{
+		ApprovalNodeID: l1.ID, ApproverID: 301, ApproverName: "主管1", Stage: models.StageLevel1Approval,
+	})
+
+	vendor := createTestVendor(t, "AddWithdraw")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规")
+
+	err := service.AddSigner(&models.AddSignerRequest{
+		VendorID:     vendor.ID,
+		ApproverID:   399,
+		ApproverName: "加签主管",
+		ApproverRole: "L1",
+		AddMode:      models.AddModeConcurrent,
+		Remark:       "需要额外主管加签",
+	}, 9001, "管理员")
+	if err != nil {
+		t.Fatalf("AddSigner error: %v", err)
+	}
+
+	signers, _ := service.GetNodeSigners(models.StageLevel1Approval)
+	found := false
+	for _, s := range signers {
+		if s.ApproverID == 399 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Added signer not found in node signers")
+	}
+
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 301, "主管1")
+
+	err = service.Withdraw(&models.WithdrawRequest{
+		VendorID:   vendor.ID,
+		Reason:     "资质有误需要补充",
+		IsRollback: true,
+	}, 100, "提交人")
+	if err != nil {
+		t.Fatalf("Withdraw error: %v", err)
+	}
+
+	flow, _ := service.GetFlow(vendor.ID)
+	if flow.Flow.CurrentStage != models.StageComplianceCheck {
+		t.Errorf("after rollback-withdraw from L1 should be COMPLIANCE_CHECK, got %s", flow.Flow.CurrentStage)
+	}
+}
+
+func TestApprovalService_Concurrent_SignRace(t *testing.T) {
+	setupTestDB(t)
+	service := NewApprovalService()
+	db := database.GetDB()
+
+	var l1 models.ApprovalNodeConfig
+	db.Where("stage = ?", models.StageLevel1Approval).First(&l1)
+	ids := []uint64{301, 302, 303, 304, 305}
+	for _, id := range ids {
+		db.Create(&models.ApprovalNodeSigner{
+			ApprovalNodeID: l1.ID, ApproverID: id, ApproverName: "主管", Stage: models.StageLevel1Approval,
+		})
+	}
+
+	vendor := createTestVendor(t, "RaceVendor")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 100, "提交人")
+	service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, 999, "合规")
+
+	done := make(chan bool, len(ids))
+	for i, id := range ids {
+		go func(uid uint64, idx int) {
+			time.Sleep(time.Duration(idx*15) * time.Millisecond)
+			_ = service.Approve(&models.ApprovalRequest{VendorID: vendor.ID}, uid, "主管")
+			done <- true
+		}(id, i)
+	}
+	for i := 0; i < len(ids); i++ {
+		<-done
+	}
+
+	flow, _ := service.GetFlow(vendor.ID)
+	stage := flow.Flow.CurrentStage
+	if stage != models.StageLevel2Approval {
+		t.Errorf("after all 5 L1 signers, should proceed to L2, got %s", stage)
+	}
+
+	var count int64
+	db.Model(&models.ApprovalRecord{}).Where("vendor_id = ? AND stage = ?", vendor.ID, models.StageLevel1Approval).Count(&count)
+	if count != int64(len(ids)) {
+		t.Errorf("expected %d L1 records, got %d", len(ids), count)
+	}
+}
+
+func TestAPIKeyService_Rotate_And_Validate(t *testing.T) {
+	setupTestDB(t)
+	svc := NewAPIKeyService()
+
+	key, secret, err := svc.Create("test_app", "测试应用")
+	if err != nil {
+		t.Fatalf("Create key error: %v", err)
+	}
+	if secret == "" {
+		t.Fatal("secret should not be empty")
+	}
+
+	secrets, err := svc.GetActiveSecrets("test_app")
+	if err != nil {
+		t.Fatalf("GetActiveSecrets error: %v", err)
+	}
+	if len(secrets) != 1 || secrets[key.Version] != secret {
+		t.Errorf("secret map mismatch: %v", secrets)
+	}
+
+	newKey, newSecret, err := svc.Rotate("test_app", 1, "第一次轮换")
+	if err != nil {
+		t.Fatalf("Rotate error: %v", err)
+	}
+	if newKey.Version != 2 {
+		t.Errorf("expected version 2, got %d", newKey.Version)
+	}
+
+	secrets2, _ := svc.GetActiveSecrets("test_app")
+	if len(secrets2) != 2 {
+		t.Errorf("after rotate, should have 2 active secrets (old+new), got %d", len(secrets2))
+	}
+	if secrets2[1] != secret || secrets2[2] != newSecret {
+		t.Error("old/new secret value mismatch")
+	}
+
+	_ = svc.Revoke("test_app", 1)
+	secrets3, _ := svc.GetActiveSecrets("test_app")
+	_, hasV1 := secrets3[1]
+	if hasV1 {
+		t.Error("revoked v1 should no longer be active")
+	}
+	if len(secrets3) != 1 || secrets3[2] != newSecret {
+		t.Error("revoke failed")
+	}
+}
+
+func TestSignatureValidation_FailurePaths(t *testing.T) {
+	body := `{"company_name":"测试"}`
+	appKey := "sig_test_app"
+	secret := "sig_test_secret_abc"
+	nonce := "abc123"
+	path := "/api/v1/vendors"
+	method := "POST"
+
+	sigOK, ts := utils.GenerateSignature(method, path, map[string]string{}, body, appKey, secret, nonce)
+
+	err := utils.ValidateSignature(sigOK, method, path, map[string]string{}, body, ts, nonce, appKey, secret)
+	if err != nil {
+		t.Errorf("valid sig should pass, got %v", err)
+	}
+
+	badSig := sigOK[:len(sigOK)-4] + "0000"
+	err = utils.ValidateSignature(badSig, method, path, map[string]string{}, body, ts, nonce, appKey, secret)
+	if err == nil {
+		t.Error("bad signature should fail")
+	}
+
+	oldTs := ts - 1000
+	err = utils.ValidateSignature(sigOK, method, path, map[string]string{}, body, oldTs, nonce, appKey, secret)
+	if err == nil {
+		t.Error("expired timestamp should fail")
+	}
+
+	err = utils.ValidateSignature(sigOK, method, path, map[string]string{}, body, ts, "", appKey, secret)
+	if err == nil {
+		t.Error("empty nonce should fail")
+	}
+
+	err = utils.ValidateSignature(sigOK, method, path, map[string]string{}, "{}", ts, nonce, appKey, secret)
+	if err == nil {
+		t.Error("different body should fail signature")
 	}
 }

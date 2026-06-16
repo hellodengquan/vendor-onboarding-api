@@ -1,0 +1,574 @@
+openapi: 3.0.3
+info:
+  title: 供应商入驻审批系统 API
+  description: |
+    供应商入驻审批系统的所有公开接口契约。
+    基于 HMAC-SHA256 签名鉴权（参见 Authentication 节）。
+    审批阶段顺序：DATA_COLLECTION → COMPLIANCE_CHECK → L1_APPROVAL（会签All）→ L2_APPROVAL（多数通过）→ FINANCE_APPROVAL → LEGAL_APPROVAL → COMPLETED。
+  version: 1.2.0
+  contact:
+    name: Vendor Onboarding Team
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Development
+tags:
+  - name: 供应商
+  - name: 资质文件
+  - name: 审批流转
+  - name: API密钥
+  - name: 元数据
+
+components:
+  securitySchemes:
+    HMACAuth:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: |
+        HMAC-SHA256 签名鉴权，所有请求必须附带以下请求头：
+        - X-App-Key 应用 key
+        - X-Timestamp 毫秒级 Unix 时间戳（有效期 5 分钟）
+        - X-Nonce 随机串（长度 ≥ 8，且 24 小时内唯一，防重放）
+        - X-Signature HMAC-SHA256 十六进制
+
+        签名字符串：`METHOD\nPATH\nQUERY_K1=V1&K2=V2\nBODY\nAPP_KEY\nTIMESTAMP\nNONCE`
+  schemas:
+    Response:
+      type: object
+      properties:
+        code: { type: integer, enum: [0, 400, 401, 403, 404, 409, 500] }
+        message: { type: string }
+        data: { type: object, nullable: true }
+    ApprovalStage:
+      type: string
+      enum: [DATA_COLLECTION, COMPLIANCE_CHECK, L1_APPROVAL, L2_APPROVAL, FINANCE_APPROVAL, LEGAL_APPROVAL, COMPLETED, REJECTED]
+    ApprovalStatus:
+      type: string
+      enum: [PENDING, PROCESSING, PARTIAL, APPROVED, REJECTED, WITHDRAWN]
+    SignType:
+      type: string
+      enum: [SINGLE, ANY, ALL, MAJORITY]
+    VendorCreateRequest:
+      type: object
+      required: [company_name, unified_social_credit_code, legal_person, contact_person, contact_phone]
+      properties:
+        company_name: { type: string, maxLength: 200, example: "上海示例信息技术有限公司" }
+        unified_social_credit_code: { type: string, pattern: '^[A-Z0-9]{18}$', example: "91310000MA1FL00001" }
+        legal_person: { type: string, maxLength: 50, example: "张三" }
+        registered_capital: { type: string, example: "500万人民币" }
+        established_date: { type: string, format: date, example: "2020-01-15" }
+        registered_address: { type: string, example: "上海市浦东新区世纪大道100号" }
+        business_scope: { type: string }
+        contact_person: { type: string, maxLength: 50, example: "李四" }
+        contact_phone: { type: string, pattern: '^1[3-9]\d{9}$', example: "13812345678" }
+        contact_email: { type: string, format: email, example: "lisi@example.com" }
+        bank_account_name: { type: string }
+        bank_account_number: { type: string }
+        bank_name: { type: string }
+    VendorResponse:
+      allOf: [{ "$ref": "#/components/schemas/VendorCreateRequest" }]
+      type: object
+      properties:
+        id: { type: integer, format: uint64 }
+        status: { type: string, enum: [DRAFT, PENDING_APPROVAL, APPROVED, REJECTED, IN_PROGRESS, BLACKLISTED] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    QualificationType:
+      type: string
+      enum: [BUSINESS_LICENSE, TAX_REGISTRATION, ID_CARD_FRONT, ID_CARD_BACK, BANK_ACCOUNT, OTHERS]
+    QualificationUploadRequest:
+      type: object
+      required: [type, name, file_url]
+      properties:
+        type: { "$ref": "#/components/schemas/QualificationType" }
+        name: { type: string }
+        file_url: { type: string, format: uri, description: "通过 /upload 接口上传后返回的存储 URL" }
+        remark: { type: string }
+        expiry_date: { type: string, format: date }
+    ApprovalRequest:
+      type: object
+      required: [vendor_id]
+      properties:
+        vendor_id: { type: integer, format: uint64 }
+        remark: { type: string }
+    ApprovalRejectRequest:
+      allOf: [{ "$ref": "#/components/schemas/ApprovalRequest" }]
+      type: object
+      required: [remark]
+      properties:
+        return_to_stage: { "$ref": "#/components/schemas/ApprovalStage", description: "可选，指定回退到哪个阶段（默认 DATA_COLLECTION）" }
+    StageTransitionRequest:
+      type: object
+      required: [vendor_id, to_stage]
+      properties:
+        vendor_id: { type: integer, format: uint64 }
+        to_stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        remark: { type: string }
+    AddSignerRequest:
+      type: object
+      required: [vendor_id, approver_id, approver_name]
+      properties:
+        vendor_id: { type: integer, format: uint64 }
+        approver_id: { type: integer, format: uint64 }
+        approver_name: { type: string }
+        approver_role: { type: string }
+        stage: { "$ref": "#/components/schemas/ApprovalStage", description: "默认当前阶段" }
+        add_mode: { type: string, enum: [BEFORE, AFTER, CONCURRENT] }
+        remark: { type: string }
+    WithdrawRequest:
+      type: object
+      required: [vendor_id]
+      properties:
+        vendor_id: { type: integer, format: uint64 }
+        reason: { type: string }
+        target_stage: { "$ref": "#/components/schemas/ApprovalStage" }
+        is_rollback: { type: boolean, default: false, description: "true=回退到上一阶段；false=退回到资料收集" }
+    ParallelGroupCreateRequest:
+      type: object
+      required: [group_name, sign_types]
+      properties:
+        group_name: { type: string }
+        description: { type: string }
+        stages:
+          type: array
+          items:
+            type: object
+            properties:
+              stage: { "$ref": "#/components/schemas/ApprovalStage" }
+              stage_name: { type: string }
+              sign_type: { "$ref": "#/components/schemas/SignType" }
+              signer_ids: { type: array, items: { type: integer, format: uint64 } }
+              signer_names: { type: array, items: { type: string } }
+    APIKeyCreateRequest:
+      type: object
+      required: [app_key, app_name]
+      properties:
+        app_key: { type: string, maxLength: 64 }
+        app_name: { type: string, maxLength: 200 }
+        description: { type: string }
+    APIKeyRotateRequest:
+      type: object
+      required: [app_key]
+      properties:
+        app_key: { type: string }
+        expire_old_hours: { type: integer, default: 72, description: "旧密钥到期缓冲小时数" }
+        remark: { type: string }
+    PresignedUploadURLRequest:
+      type: object
+      required: [file_name, content_type]
+      properties:
+        file_name: { type: string, maxLength: 255 }
+        content_type: { type: string, maxLength: 128 }
+        file_size: { type: integer, format: int64 }
+
+security:
+  - HMACAuth: []
+
+paths:
+  /vendors:
+    post:
+      tags: [供应商]
+      summary: 创建供应商档案（草稿）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/VendorCreateRequest" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { allOf: [{ "$ref": "#/components/schemas/Response" }], properties: { data: { "$ref": "#/components/schemas/VendorResponse" } } } } } }
+        "400": { description: 校验失败 }
+    get:
+      tags: [供应商]
+      summary: 分页查询供应商
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: page_size
+          schema: { type: integer, default: 20, maximum: 200 }
+        - in: query
+          name: keyword
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}:
+    get:
+      tags: [供应商]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [供应商]
+      summary: 更新草稿供应商资料
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/submit:
+    post:
+      tags: [供应商]
+      summary: 提交审批（自动流转进入合规检查）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/approve:
+    post:
+      tags: [审批流转]
+      summary: 当前阶段审批通过
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/ApprovalRequest" }
+      responses:
+        "200": { description: OK }
+  /vendors/{id}/approval/reject:
+    post:
+      tags: [审批流转]
+      summary: 当前阶段审批驳回（直接终止流程）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/ApprovalRejectRequest" }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/flow:
+    get:
+      tags: [审批流转]
+      summary: 查询审批流详情（包含所有记录）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/records:
+    get:
+      tags: [审批流转]
+      summary: 查询审批记录列表
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/transition:
+    post:
+      tags: [审批流转]
+      summary: 管理员手动阶段跳转（特批）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/StageTransitionRequest" }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/add-signer:
+    post:
+      tags: [审批流转]
+      summary: 加签（增加额外审批人）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/AddSignerRequest" }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/approval/withdraw:
+    post:
+      tags: [审批流转]
+      summary: 撤回（提交人或管理员）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/WithdrawRequest" }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/withdrawals:
+    get:
+      tags: [审批流转]
+      summary: 查询撤回历史
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/qualifications:
+    get:
+      tags: [资质文件]
+      summary: 列表查询供应商资质
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [资质文件]
+      summary: 新增/绑定资质文件记录（文件需先通过 /upload 上传）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/QualificationUploadRequest" }
+      responses:
+        "200": { description: OK }
+
+  /vendors/{id}/qualifications/{qid}:
+    delete:
+      tags: [资质文件]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, format: uint64 }
+        - in: path
+          name: qid
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200": { description: OK }
+
+  /upload:
+    post:
+      tags: [资质文件]
+      summary: 上传资质文件 multipart/form-data（字段: file）
+      description: |
+        服务端执行以下处理链：
+        1. 类型/大小校验（MIME+扩展名白名单，≤50MB）
+        2. 病毒特征扫描（脚本扩展/魔数/内容模式）
+        3. 图片文件（jpeg/png/webp）自动裁切为 ≤1920px，并剥离 EXIF
+        4. PDF 文件剥离所有元数据
+        5. 写入 Storage（local / s3）
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "200":
+          description: "上传成功"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer }
+                  data:
+                    type: object
+                    properties:
+                      url: { type: string, format: uri }
+                      filename: { type: string }
+                      stored_key: { type: string }
+                      size: { type: integer, format: int64 }
+                      content_type: { type: string }
+                      virus_clean: { type: boolean }
+                      processed: { type: boolean }
+        "400":
+          description: 文件类型/大小/扩展名不被允许，或病毒扫描命中
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, enum: [400] }
+                  message: { type: string }
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        field: { type: string }
+                        message: { type: string }
+                        rule: { type: string }
+
+  /upload/presign:
+    post:
+      tags: [资质文件]
+      summary: 生成预签名上传 URL（大文件客户端直传）
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/PresignedUploadURLRequest" }
+      responses:
+        "200":
+          description: 预签名 URL
+          content:
+            application/json:
+              schema:
+                allOf: [{ "$ref": "#/components/schemas/Response" }]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      presigned_url: { type: string }
+                      key: { type: string }
+                      expires_in_seconds: { type: integer }
+
+  /approval-node-configs:
+    get: { tags: [元数据], summary: "审批节点配置列表", responses: { "200": { description: OK } } }
+    post:
+      tags: [元数据]
+      summary: 新增审批节点配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stage, sign_type]
+              properties:
+                stage: { "$ref": "#/components/schemas/ApprovalStage" }
+                stage_order: { type: integer }
+                stage_name: { type: string }
+                sign_type: { "$ref": "#/components/schemas/SignType" }
+                threshold: { type: number, format: float }
+                approvers:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      approver_id: { type: integer, format: uint64 }
+                      approver_name: { type: string }
+                      approver_role: { type: string }
+      responses: { "200": { description: OK } }
+
+  /approval-parallel-groups:
+    post:
+      tags: [元数据]
+      summary: 创建并签组模板（多个阶段并行审批）
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/ParallelGroupCreateRequest" }
+      responses: { "200": { description: OK } }
+
+  /api-keys:
+    post:
+      tags: [API密钥]
+      summary: 创建应用 Key+Secret（Secret 仅返回一次）
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/APIKeyCreateRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ "$ref": "#/components/schemas/Response" }]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      app_key: { type: string }
+                      app_secret: { type: string, description: "仅返回一次明文，服务端仅保存哈希" }
+                      version: { type: integer }
+    get:
+      tags: [API密钥]
+      summary: 列出所有 API Key
+      responses: { "200": { description: OK } }
+
+  /api-keys/rotate:
+    post:
+      tags: [API密钥]
+      summary: 密钥轮换（保留旧密钥 x 小时供双写切换）
+      requestBody:
+        content:
+          application/json:
+            schema: { "$ref": "#/components/schemas/APIKeyRotateRequest" }
+      responses:
+        "200":
+          description: 返回新密钥，旧密钥会在 N 小时后自动过期
+          content:
+            application/json:
+              schema:
+                allOf: [{ "$ref": "#/components/schemas/Response" }]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      app_key: { type: string }
+                      new_secret: { type: string }
+                      version: { type: integer }
+                      old_expires_at: { type: string, format: date-time }
+
+  /api-keys/{app_key}:
+    delete:
+      tags: [API密钥]
+      summary: 立即撤销某应用 key（指定版本或全量）
+      parameters:
+        - in: path
+          name: app_key
+          required: true
+          schema: { type: string }
+        - in: query
+          name: version
+          schema: { type: integer, description: "不填则撤销全部版本" }
+      responses: { "200": { description: OK } }
+
+  /api-keys/cleanup:
+    post:
+      tags: [API密钥]
+      summary: 立即清除所有已过期的密钥（定时任务手动触发）
+      responses: { "200": { description: OK } }

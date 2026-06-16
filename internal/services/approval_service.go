@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"vendor-onboarding-api/internal/database"
 	"vendor-onboarding-api/internal/models"
@@ -16,8 +17,12 @@ var StageOrderMap = map[models.ApprovalStage]int{
 	models.StageComplianceCheck: 1,
 	models.StageLevel1Approval:  2,
 	models.StageLevel2Approval:  3,
-	models.StageCompleted:       4,
+	models.StageFinanceApproval: 4,
+	models.StageLegalApproval:   5,
+	models.StageParallelGroup:   6,
+	models.StageCompleted:       7,
 	models.StageRejected:        -1,
+	models.StageWithdrawn:       -2,
 }
 
 type ApprovalService struct{}
@@ -212,25 +217,41 @@ func (s *ApprovalService) evaluateSignCondition(signType models.SignType, totalS
 func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64, approverName string) error {
 	db := database.GetDB()
 
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
 	var flow models.ApprovalFlow
-	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		tx.Rollback()
 		return errors.New("审批流程不存在")
 	}
 
 	if flow.Status == models.ApprovalStatusApproved {
+		tx.Rollback()
 		return errors.New("流程已完成审批")
 	}
 	if flow.Status == models.ApprovalStatusRejected {
+		tx.Rollback()
 		return errors.New("流程已被驳回")
 	}
 
 	if err := s.validateSignerPermission(flow.CurrentStage, approverID); err != nil {
+		tx.Rollback()
 		return err
 	}
 
 	var existing models.ApprovalRecord
-	if err := db.Where("vendor_id = ? AND stage = ? AND approver_id = ?",
+	if err := tx.Where("vendor_id = ? AND stage = ? AND approver_id = ?",
 		req.VendorID, flow.CurrentStage, approverID).First(&existing).Error; err == nil {
+		tx.Rollback()
 		return errors.New("该审批人已在本阶段签署过")
 	}
 
@@ -245,27 +266,51 @@ func (s *ApprovalService) Approve(req *models.ApprovalRequest, approverID uint64
 		Remark:       req.Remark,
 		ApprovedAt:   &now,
 	}
-	if err := db.Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return err
 	}
 
-	flow.ApprovedCount++
+	var nodeConfig models.ApprovalNodeConfig
+	tx.Where("stage = ?", flow.CurrentStage).First(&nodeConfig)
+	var approvedCount, rejectedCount int64
+	tx.Model(&models.ApprovalRecord{}).
+		Where("vendor_id = ? AND stage = ? AND status = ?", req.VendorID, flow.CurrentStage, models.ApprovalStatusApproved).
+		Count(&approvedCount)
+	tx.Model(&models.ApprovalRecord{}).
+		Where("vendor_id = ? AND stage = ? AND status = ?", req.VendorID, flow.CurrentStage, models.ApprovalStatusRejected).
+		Count(&rejectedCount)
+
+	flow.ApprovedCount = int(approvedCount)
+	flow.RejectedCount = int(rejectedCount)
 	signerCount, _ := s.countSigners(flow.CurrentStage)
 	flow.SignerCount = signerCount
 
-	stageStatus, _ := s.GetStageSignStatus(req.VendorID, flow.CurrentStage)
-	if flow.RejectedCount > 0 {
-		return s.rejectFlow(db, &flow, req.VendorID, approverID, approverName, "会签中有人驳回，流程终止")
+	if rejectedCount > 0 {
+		if err := s.rejectFlow(tx, &flow, req.VendorID, approverID, approverName, "会签中有人驳回，流程终止"); err != nil {
+			tx.Rollback()
+			return err
+		}
+		return tx.Commit().Error
 	}
 
-	if stageStatus != nil && stageStatus.IsComplete {
-		return s.advanceToNextStage(db, &flow, req.VendorID)
+	isComplete := s.evaluateSignCondition(nodeConfig.SignType, signerCount, int(approvedCount), int(rejectedCount))
+	if isComplete {
+		if err := s.advanceToNextStage(tx, &flow, req.VendorID); err != nil {
+			tx.Rollback()
+			return err
+		}
+		return tx.Commit().Error
 	}
 
-	if flow.ApprovedCount > 0 && flow.ApprovedCount < signerCount {
+	if approvedCount > 0 && approvedCount < int64(signerCount) {
 		flow.Status = models.ApprovalStatusPartial
 	}
-	return db.Save(&flow).Error
+	if err := tx.Save(&flow).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit().Error
 }
 
 func (s *ApprovalService) Reject(req *models.ApprovalRejectRequest, approverID uint64, approverName string) error {
@@ -448,8 +493,210 @@ func (s *ApprovalService) getNextStage(current models.ApprovalStage) (models.App
 	case models.StageLevel1Approval:
 		return models.StageLevel2Approval, StageOrderMap[models.StageLevel2Approval]
 	case models.StageLevel2Approval:
+		return models.StageFinanceApproval, StageOrderMap[models.StageFinanceApproval]
+	case models.StageFinanceApproval:
+		return models.StageLegalApproval, StageOrderMap[models.StageLegalApproval]
+	case models.StageLegalApproval:
 		return models.StageCompleted, StageOrderMap[models.StageCompleted]
 	default:
 		return models.StageCompleted, StageOrderMap[models.StageCompleted]
 	}
+}
+
+func (s *ApprovalService) AddSigner(req *models.AddSignerRequest, addedBy uint64, addedByName string) error {
+	db := database.GetDB()
+
+	var flow models.ApprovalFlow
+	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		return errors.New("流程不存在")
+	}
+	if flow.Status == models.ApprovalStatusApproved || flow.Status == models.ApprovalStatusRejected || flow.Status == models.ApprovalStatusWithdrawn {
+		return errors.New("当前流程状态不允许加签")
+	}
+
+	stage := req.Stage
+	if stage == "" {
+		stage = flow.CurrentStage
+	}
+
+	var maxSeq int64
+	db.Model(&models.ApprovalNodeSigner{}).Where("stage = ?", stage).Select("COALESCE(MAX(sequence),0)").Scan(&maxSeq)
+	var maxAdd int64
+	db.Model(&models.AdditionalSignerRecord{}).Where("vendor_id = ? AND stage = ?", req.VendorID, stage).Select("COALESCE(MAX(sequence),0)").Scan(&maxAdd)
+	seq := int(maxSeq) + int(maxAdd) + 1 + req.Sequence
+
+	var nodeCfg models.ApprovalNodeConfig
+	db.Where("stage = ?", stage).First(&nodeCfg)
+	if nodeCfg.ID > 0 {
+		signer := &models.ApprovalNodeSigner{
+			ApprovalNodeID: nodeCfg.ID,
+			ApproverID:     req.ApproverID,
+			ApproverName:   req.ApproverName,
+			ApproverRole:   req.ApproverRole,
+			Stage:          stage,
+			Source:         models.SignerSourceAddition,
+			Sequence:       seq,
+			AddedBy:        &addedBy,
+		}
+		if err := db.Create(signer).Error; err != nil {
+			return err
+		}
+	}
+
+	add := &models.AdditionalSignerRecord{
+		VendorID:     req.VendorID,
+		Stage:        stage,
+		ApproverID:   req.ApproverID,
+		ApproverName: req.ApproverName,
+		ApproverRole: req.ApproverRole,
+		AddMode:      req.AddMode,
+		AddedBy:      addedBy,
+		AddedByName:  addedByName,
+		Remark:       req.Remark,
+		Sequence:     seq,
+	}
+	if err := db.Create(add).Error; err != nil {
+		return err
+	}
+
+	signerCount, _ := s.countSigners(stage)
+	if stage == flow.CurrentStage {
+		flow.SignerCount = signerCount
+		db.Save(&flow)
+	}
+	return nil
+}
+
+func (s *ApprovalService) Withdraw(req *models.WithdrawRequest, withdrawnBy uint64, withdrawnByName string) error {
+	db := database.GetDB()
+
+	var flow models.ApprovalFlow
+	if err := db.Where("vendor_id = ?", req.VendorID).First(&flow).Error; err != nil {
+		return errors.New("流程不存在")
+	}
+	if flow.Status == models.ApprovalStatusApproved {
+		return errors.New("已完成的审批不可撤回")
+	}
+
+	toStage := req.ToStage
+	toOrder := 0
+	if toStage != "" {
+		var ok bool
+		toOrder, ok = StageOrderMap[toStage]
+		if !ok {
+			return errors.New("目标阶段无效")
+		}
+		if toOrder >= flow.StageOrder {
+			return errors.New("只能回退到更早的阶段")
+		}
+	} else {
+		switch flow.CurrentStage {
+		case models.StageDataCollection:
+			return errors.New("当前为初始阶段，无需撤回")
+		case models.StageComplianceCheck:
+			toStage = models.StageDataCollection
+		case models.StageLevel1Approval:
+			toStage = models.StageComplianceCheck
+		case models.StageLevel2Approval:
+			toStage = models.StageLevel1Approval
+		case models.StageFinanceApproval:
+			toStage = models.StageLevel2Approval
+		case models.StageLegalApproval:
+			toStage = models.StageFinanceApproval
+		default:
+			toStage = models.StageLevel1Approval
+		}
+		toOrder = StageOrderMap[toStage]
+	}
+
+	now := time.Now()
+	record := &models.WithdrawalRecord{
+		VendorID:        req.VendorID,
+		FromStage:       flow.CurrentStage,
+		FromStageOrder:  flow.StageOrder,
+		ToStage:         toStage,
+		ToStageOrder:    toOrder,
+		WithdrawnBy:     withdrawnBy,
+		WithdrawnByName: withdrawnByName,
+		Reason:          req.Reason,
+		IsRollback:      req.IsRollback,
+		CreatedAt:       now,
+	}
+	if err := db.Create(record).Error; err != nil {
+		return err
+	}
+
+	flow.CurrentStage = toStage
+	flow.StageOrder = toOrder
+	flow.Status = models.ApprovalStatusWithdrawn
+	flow.ApprovedCount = 0
+	flow.RejectedCount = 0
+	flow.WithdrawnBy = &withdrawnBy
+	flow.WithdrawnAt = &now
+	if err := db.Save(&flow).Error; err != nil {
+		return err
+	}
+
+	if req.IsRollback {
+		var vendor models.Vendor
+		db.First(&vendor, req.VendorID)
+		switch toStage {
+		case models.StageDataCollection:
+			vendor.Status = models.VendorStatusDraft
+		case models.StageComplianceCheck:
+			vendor.Status = models.VendorStatusComplianceCheck
+		default:
+			vendor.Status = models.VendorStatusPendingApproval
+		}
+		db.Save(&vendor)
+
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			db.Model(&models.ApprovalFlow{}).Where("vendor_id = ?", req.VendorID).Update("status", models.ApprovalStatusPending)
+		}()
+	} else {
+		var vendor models.Vendor
+		db.First(&vendor, req.VendorID)
+		vendor.Status = models.VendorStatusDraft
+		db.Save(&vendor)
+	}
+
+	return nil
+}
+
+func (s *ApprovalService) CreateParallelGroup(req *models.ParallelGroupCreateRequest) (*models.ParallelGroup, error) {
+	db := database.GetDB()
+	if len(req.SubStages) < 2 {
+		return nil, errors.New("并签组至少需要两个子阶段")
+	}
+	subStagesJSON := "["
+	for i, ss := range req.SubStages {
+		if i > 0 {
+			subStagesJSON += ","
+		}
+		subStagesJSON += "\"" + string(ss) + "\""
+	}
+	subStagesJSON += "]"
+
+	group := &models.ParallelGroup{
+		GroupCode:    req.GroupCode,
+		Name:         req.Name,
+		SubStages:    subStagesJSON,
+		SignType:     req.SignType,
+		JoinStrategy: req.JoinStrategy,
+		IsEnabled:    true,
+	}
+	if err := db.Create(group).Error; err != nil {
+		return nil, err
+	}
+	return group, nil
+}
+
+func (s *ApprovalService) ListWithdrawals(vendorID uint64) ([]models.WithdrawalRecord, error) {
+	db := database.GetDB()
+	var list []models.WithdrawalRecord
+	if err := db.Where("vendor_id = ?", vendorID).Order("id DESC").Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
 }
