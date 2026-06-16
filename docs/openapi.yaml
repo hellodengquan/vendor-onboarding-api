@@ -99,6 +99,11 @@ components:
         rejected_count: { type: integer, description: 已驳回人数 }
         is_complete: { type: boolean, description: 该节点是否已完成 }
         is_current: { type: boolean, description: 是否为当前正在处理的节点 }
+        sla_hours: { type: integer, description: SLA 要求处理时长（小时） }
+        timeout_hours: { type: integer, description: 超时自动升级时长（小时） }
+        escalation_role: { type: string, description: 超时时升级通知角色 }
+        waiting_time_ms: { type: integer, format: int64, description: 当前节点已等待时长（毫秒） }
+        sla_breached: { type: boolean, description: 是否已超出 SLA }
         signers:
           type: array
           description: 签署人列表及状态
@@ -108,6 +113,7 @@ components:
           description: 该节点的所有审批记录
           items: { "$ref": "#/components/schemas/ApprovalRecord" }
         completed_at: { type: string, format: date-time, description: 节点完成时间 }
+        entered_at: { type: string, format: date-time, description: 进入该节点的时间 }
     ApprovalRecord:
       type: object
       description: 审批记录

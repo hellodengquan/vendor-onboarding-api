@@ -72,14 +72,17 @@ type ApprovalFlow struct {
 }
 
 type ApprovalNodeConfig struct {
-	ID           uint64        `gorm:"primaryKey;autoIncrement" json:"id"`
-	Stage        ApprovalStage `gorm:"size:32;not null;index" json:"stage"`
-	StageOrder   int           `gorm:"not null;index" json:"stage_order"`
-	StageName    string        `gorm:"size:128;not null" json:"stage_name"`
-	SignType     SignType      `gorm:"size:16;not null;default:ALL" json:"sign_type"`
-	IsEnabled    bool          `gorm:"not null;default:true" json:"is_enabled"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	ID            uint64        `gorm:"primaryKey;autoIncrement" json:"id"`
+	Stage         ApprovalStage `gorm:"size:32;not null;index" json:"stage"`
+	StageOrder    int           `gorm:"not null;index" json:"stage_order"`
+	StageName     string        `gorm:"size:128;not null" json:"stage_name"`
+	SignType      SignType      `gorm:"size:16;not null;default:ALL" json:"sign_type"`
+	IsEnabled     bool          `gorm:"not null;default:true" json:"is_enabled"`
+	SlaHours      int           `gorm:"default:24" json:"sla_hours"`
+	TimeoutHours  int           `gorm:"default:72" json:"timeout_hours"`
+	EscalationRole string       `gorm:"size:64" json:"escalation_role,omitempty"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
 }
 
 type ApprovalNodeSigner struct {

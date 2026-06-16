@@ -97,6 +97,30 @@ func (s *APIKeyService) GetActiveSecrets(appKey string) (map[int]string, error) 
 	return result, nil
 }
 
+func (s *APIKeyService) HasRotatingKey(appKey string) (bool, error) {
+	db := database.GetDB()
+	var count int64
+	now := time.Now()
+	err := db.Model(&models.APIKey{}).
+		Where("app_key = ? AND status = ? AND (expire_at IS NULL OR expire_at > ?)", appKey, "ROTATING", now).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func (s *APIKeyService) GetLatestExpiredInfo(appKey string) (string, bool) {
+	db := database.GetDB()
+	var key models.APIKey
+	now := time.Now()
+	err := db.Where("app_key = ? AND status IN ? AND expire_at IS NOT NULL AND expire_at <= ?",
+		appKey, []string{"ROTATING", "EXPIRED"}, now).
+		Order("expire_at DESC").
+		First(&key).Error
+	if err != nil || key.ExpireAt == nil {
+		return "", false
+	}
+	return key.ExpireAt.Format(time.RFC3339), true
+}
+
 func (s *APIKeyService) Rotate(appKey string, oldExpireHours int, remark string) (*models.APIKey, string, error) {
 	db := database.GetDB()
 

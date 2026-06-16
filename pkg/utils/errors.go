@@ -64,6 +64,18 @@ func ConflictError(message string) error {
 	return &APIError{Code: http.StatusConflict, Message: message}
 }
 
+func PayloadTooLargeError(message string) error {
+	return &APIError{Code: http.StatusRequestEntityTooLarge, Message: message}
+}
+
+func TooManyRequestsError(message string) error {
+	return &APIError{Code: http.StatusTooManyRequests, Message: message}
+}
+
+type HTTPStatusCoder interface {
+	HTTPStatusCode() int
+}
+
 func WriteError(c *gin.Context, err error) {
 	if err == nil {
 		return
@@ -102,6 +114,16 @@ func WriteError(c *gin.Context, err error) {
 		c.JSON(apiErr.Code, Response{
 			Code:    apiErr.Code,
 			Message: apiErr.Message,
+		})
+		return
+	}
+
+	var statusCoder HTTPStatusCoder
+	if errors.As(err, &statusCoder) {
+		code := statusCoder.HTTPStatusCode()
+		c.JSON(code, Response{
+			Code:    code,
+			Message: err.Error(),
 		})
 		return
 	}

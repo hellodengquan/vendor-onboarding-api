@@ -1,7 +1,10 @@
 package services
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"mime/multipart"
 	"strconv"
 	"time"
@@ -11,6 +14,37 @@ import (
 	"vendor-onboarding-api/internal/models"
 	"vendor-onboarding-api/pkg/utils"
 )
+
+const (
+	DefaultMaxBodyBytes = 1 << 20
+	MaxBodyOverflowMode = "reject"
+)
+
+var bodyLimitConfig = struct {
+	MaxBytes    int64
+	OverflowMode string
+}{
+	MaxBytes:     DefaultMaxBodyBytes,
+	OverflowMode: "reject",
+}
+
+func SetBodyLimit(maxBytes int64, overflowMode string) {
+	if maxBytes > 0 {
+		bodyLimitConfig.MaxBytes = maxBytes
+	}
+	if overflowMode == "reject" || overflowMode == "stream" || overflowMode == "truncate" {
+		bodyLimitConfig.OverflowMode = overflowMode
+	}
+}
+
+type BodyTooLargeError struct {
+	MaxBytes  int64
+	ActualBytes int64
+}
+
+func (e *BodyTooLargeError) Error() string {
+	return "request body too large"
+}
 
 type UploadFileRequest struct {
 	File       *multipart.FileHeader `form:"file"`
@@ -100,6 +134,37 @@ type bindResult struct {
 }
 
 func BindAndValidate[T any](c *gin.Context, req *T) (*T, error) {
+	if bodyLimitConfig.OverflowMode != "none" {
+		contentLen := c.Request.ContentLength
+
+		if contentLen > bodyLimitConfig.MaxBytes {
+			if bodyLimitConfig.OverflowMode == "reject" {
+				return nil, utils.PayloadTooLargeError(
+					fmt.Sprintf("请求体过大，最大允许 %d 字节，实际 %d 字节",
+						bodyLimitConfig.MaxBytes, contentLen))
+			}
+		}
+
+		if contentLen < 0 || contentLen > bodyLimitConfig.MaxBytes {
+			body, err := io.ReadAll(io.LimitReader(c.Request.Body, bodyLimitConfig.MaxBytes+1))
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(body)) > bodyLimitConfig.MaxBytes {
+				if bodyLimitConfig.OverflowMode == "reject" {
+					return nil, utils.PayloadTooLargeError(
+						fmt.Sprintf("请求体过大，最大允许 %d 字节", bodyLimitConfig.MaxBytes))
+				}
+				if bodyLimitConfig.OverflowMode == "truncate" {
+					body = body[:bodyLimitConfig.MaxBytes]
+				}
+			}
+
+			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+			c.Set("body_truncated", int64(len(body)) > bodyLimitConfig.MaxBytes)
+		}
+	}
+
 	if err := c.ShouldBindJSON(req); err != nil {
 		return nil, &utils.ValidationError{
 			Errors: []utils.FieldError{{Field: "body", Message: "请求参数格式错误: " + err.Error(), Rule: "BIND"}},

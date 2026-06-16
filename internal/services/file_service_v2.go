@@ -44,6 +44,18 @@ type FileUploadResult struct {
 	ProcessResult *ProcessResult        `json:"process_result,omitempty"`
 	Hash          string                `json:"hash"`
 	OriginalSize  int64                 `json:"original_size"`
+	VirusScan     *VirusScanInfo        `json:"virus_scan,omitempty"`
+}
+
+type VirusScanInfo struct {
+	ScanSkipped   bool     `json:"scan_skipped"`
+	Degraded      bool     `json:"degraded"`
+	DegradeReason string   `json:"degrade_reason,omitempty"`
+	RateLimited   bool     `json:"rate_limited"`
+	QueuedMs      int64    `json:"queued_ms"`
+	Threats       []string `json:"threats,omitempty"`
+	ScanTimeMs    int64    `json:"scan_time_ms"`
+	ScannerName   string   `json:"scanner_name"`
 }
 
 func (s *FileServiceV2) UploadQualificationFile(
@@ -83,12 +95,26 @@ func (s *FileServiceV2) UploadQualificationFile(
 
 	processResult := &ProcessResult{}
 
-	infected, hits, err := ScanVirus(tmpPath, ext)
-	if err != nil {
-		return nil, fmt.Errorf("virus scan error: %w", err)
-	}
-	if infected {
-		return nil, fmt.Errorf("安全扫描发现风险: %v", hits)
+	var virusScanInfo *VirusScanInfo
+	if opts.SkipVirusScan {
+		virusScanInfo = &VirusScanInfo{ScanSkipped: true, ScannerName: "skipped"}
+	} else {
+		scanResult, err := ScanVirusWithContext(ctx, tmpPath, ext)
+		if err != nil {
+			return nil, fmt.Errorf("virus scan error: %w", err)
+		}
+		virusScanInfo = &VirusScanInfo{
+			Degraded:      scanResult.Degraded,
+			DegradeReason: scanResult.DegradeReason,
+			RateLimited:   scanResult.RateLimited,
+			QueuedMs:      scanResult.QueuedMs,
+			Threats:       scanResult.Threats,
+			ScanTimeMs:    scanResult.ScanTimeMs,
+			ScannerName:   scanResult.ScannerName,
+		}
+		if !scanResult.Clean {
+			return nil, fmt.Errorf("安全扫描发现风险: %v", scanResult.Threats)
+		}
 	}
 	processResult.Applied = append(processResult.Applied, StepVirusScan)
 
@@ -167,6 +193,7 @@ func (s *FileServiceV2) UploadQualificationFile(
 		ProcessResult: processResult,
 		Hash:          hash,
 		OriginalSize:  file.Size,
+		VirusScan:     virusScanInfo,
 	}, nil
 }
 

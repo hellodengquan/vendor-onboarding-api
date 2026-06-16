@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -55,7 +56,26 @@ func (h *QualificationHandler) UploadFile(c *gin.Context) {
 		utils.WriteError(c, err)
 		return
 	}
+
+	if result.VirusScan != nil {
+		c.Header("X-Virus-Scan-Degraded", boolToString(result.VirusScan.Degraded))
+		c.Header("X-Virus-Scan-Rate-Limited", boolToString(result.VirusScan.RateLimited))
+		c.Header("X-Virus-Scan-Queued-Ms", fmt.Sprintf("%d", result.VirusScan.QueuedMs))
+		c.Header("X-Virus-Scan-Time-Ms", fmt.Sprintf("%d", result.VirusScan.ScanTimeMs))
+		c.Header("X-Virus-Scanner", result.VirusScan.ScannerName)
+		if result.VirusScan.DegradeReason != "" {
+			c.Header("X-Virus-Scan-Degrade-Reason", result.VirusScan.DegradeReason)
+		}
+	}
+
 	utils.Success(c, result)
+}
+
+func boolToString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 func (h *QualificationHandler) ListByVendor(c *gin.Context) {

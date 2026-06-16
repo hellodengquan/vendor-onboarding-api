@@ -31,6 +31,16 @@ const (
 	ErrMissingSignature = authError("缺少 X-Signature")
 	ErrInvalidTimestamp = authError("时间戳格式无效")
 	ErrInvalidAppKey    = authError("无效的 AppKey")
+	ErrAPIKeyExpired    = authError("API Key 已过期，请使用新的 API Key")
+	ErrSignatureMismatch = authError("签名不匹配")
+)
+
+const (
+	APIKeyHeaderStatus    = "X-API-Key-Status"
+	APIKeyHeaderExpiredAt = "X-API-Key-Expired-At"
+	APIKeyStatusValid     = "valid"
+	APIKeyStatusExpired   = "expired"
+	APIKeyStatusRotating  = "rotating"
 )
 
 var defaultAPIKeySvc = services.NewAPIKeyService()
@@ -68,35 +78,61 @@ func AuthWithConfig(cfg AuthConfig) gin.HandlerFunc {
 			return
 		}
 
-		if err := validateSignatureMulti(c, cfg.APIKeySvc, sig, appKey, tsStr, nonce); err != nil {
-			utils.Unauthorized(c, "认证失败: "+err.Error())
+		result, err := validateSignatureMulti(c, cfg.APIKeySvc, sig, appKey, tsStr, nonce)
+		if err != nil {
+			if result != nil {
+				c.Header(APIKeyHeaderStatus, result.Status)
+				if result.ExpiredAt != "" {
+					c.Header(APIKeyHeaderExpiredAt, result.ExpiredAt)
+				}
+			}
+			if errors.Is(err, ErrAPIKeyExpired) {
+				utils.Unauthorized(c, err.Error())
+			} else {
+				utils.Unauthorized(c, "认证失败: "+err.Error())
+			}
 			c.Abort()
 			return
+		}
+		if result != nil {
+			c.Header(APIKeyHeaderStatus, result.Status)
 		}
 		c.Next()
 	}
 }
 
-func validateSignatureMulti(c *gin.Context, svc *services.APIKeyService, sig string, appKey string, tsStr string, nonce string) error {
+type authResult struct {
+	Status    string
+	ExpiredAt string
+}
+
+func validateSignatureMulti(c *gin.Context, svc *services.APIKeyService, sig string, appKey string, tsStr string, nonce string) (*authResult, error) {
 	switch {
 	case appKey == "":
-		return ErrMissingAppKey
+		return nil, ErrMissingAppKey
 	case tsStr == "":
-		return ErrMissingTimestamp
+		return nil, ErrMissingTimestamp
 	case nonce == "":
-		return ErrMissingNonce
+		return nil, ErrMissingNonce
 	case sig == "":
-		return ErrMissingSignature
+		return nil, ErrMissingSignature
 	}
 
 	ts, err := strconv.ParseInt(tsStr, 10, 64)
 	if err != nil {
-		return ErrInvalidTimestamp
+		return nil, ErrInvalidTimestamp
 	}
 
 	secretMap, err := svc.GetActiveSecrets(appKey)
 	if err != nil || len(secretMap) == 0 {
-		return ErrInvalidAppKey
+		expiredInfo, hasExpired := svc.GetLatestExpiredInfo(appKey)
+		if hasExpired {
+			return &authResult{
+				Status:    APIKeyStatusExpired,
+				ExpiredAt: expiredInfo,
+			}, ErrAPIKeyExpired
+		}
+		return nil, ErrInvalidAppKey
 	}
 
 	queryMap := map[string]string{}
@@ -118,19 +154,24 @@ func validateSignatureMulti(c *gin.Context, svc *services.APIKeyService, sig str
 	path := c.Request.URL.Path
 	method := c.Request.Method
 
+	status := APIKeyStatusValid
+	if hasRotating, _ := svc.HasRotatingKey(appKey); hasRotating {
+		status = APIKeyStatusRotating
+	}
+
 	var lastErr error
 	for _, secret := range secretMap {
 		msg := utils.BuildSignatureString(method, path, queryMap, bodyStr, ts, nonce, appKey)
 		expected := utils.HMACSHA256(msg, secret)
 		if hmac.Equal([]byte(expected), []byte(sig)) {
-			return nil
+			return &authResult{Status: status}, nil
 		}
-		lastErr = errors.New("签名不匹配")
+		lastErr = ErrSignatureMismatch
 	}
 	if lastErr != nil {
-		return lastErr
+		return &authResult{Status: status}, lastErr
 	}
-	return errors.New("签名校验失败")
+	return &authResult{Status: status}, errors.New("签名校验失败")
 }
 
 var _ = strings.TrimSpace
